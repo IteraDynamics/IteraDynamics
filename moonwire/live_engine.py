@@ -5,6 +5,7 @@ import sys
 import random
 from pathlib import Path
 from datetime import datetime, timezone
+import requests
 
 # Import the Core Architecture
 from apex_core.paper_broker import PaperBroker
@@ -20,13 +21,25 @@ logger = logging.getLogger("MoonWire_Live")
 # ---------------------------------------------------------------------
 # MOCKS (Placeholders for your real code)
 # ---------------------------------------------------------------------
-class MockDataFeed:
-    """Simulates Binance/CCXT."""
+class CoinbasePublicFeed:
+    """Fetches REAL live prices from Coinbase Public API (US-Friendly)."""
     def fetch_latest_price(self, symbol: str) -> float:
-        # Simulate a random walk price around $95k
-        base = 95000.0
-        noise = random.uniform(-50, 50)
-        return base + noise
+        # Coinbase format: BTC-USD
+        pair = f"{symbol.upper()}-USD"
+        url = f"https://api.coinbase.com/v2/prices/{pair}/spot"
+        
+        try:
+            resp = requests.get(url, timeout=5)
+            data = resp.json()
+            # Structure: {'data': {'base': 'BTC', 'currency': 'USD', 'amount': '95000.00'}}
+            price = float(data['data']['amount'])
+            
+            logger.info(f"🔌 Feed: {symbol} @ ${price:,.2f}")
+            return price
+        except Exception as e:
+            logger.error(f"Data Feed Error: {e}")
+            # Fallback to keep loop alive
+            return 95000.0
 
 class MockStrategy:
     """Simulates your ML Model + Feature Engineering."""
@@ -47,7 +60,7 @@ class LiveEngine:
     def __init__(self, symbol: str, broker: PaperBroker):
         self.symbol = symbol.upper()
         self.broker = broker
-        self.feed = MockDataFeed()      # <--- We will swap this later
+        self.feed = CoinbasePublicFeed()      # <--- We will swap this later
         self.strategy = MockStrategy()  # <--- We will swap this later
         self.running = True
 
