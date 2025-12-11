@@ -1,8 +1,12 @@
 # src/signal_generator.py
 from __future__ import annotations
 
-import os
 import sys
+# FORCE UTF-8 OUTPUT TO PREVENT SUBPROCESS CRASHES ON WINDOWS
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+
+import os
 import json
 import logging
 import pandas as pd
@@ -181,17 +185,21 @@ def _infer_ml(asset: str, strategy: str = None) -> Dict[str, Any]:
     if _ML_INFER_FN is None: return {"ok": False, "reason": "ml_unavailable"}
 
     try:
-        out = _ML_INFER_FN(asset, strategy=strategy)  
+        # CRITICAL CHANGE: The infer_asset_signal function now returns a dict with model_name
+        out = _ML_INFER_FN(asset, strategy=strategy) 
         if not isinstance(out, dict): return {"ok": False, "reason": "ml_bad_return_type"}
         if out.get("error"): return {"ok": False, "reason": f"ml_error:{out['error']}"}
         
         direction = out.get("direction") or out.get("dir")
         conf = out.get("confidence") if out.get("confidence") is not None else out.get("conf")
         
+        # New key capture
+        model_name = out.get("model_name", "Unknown Model") # <-- CRITICAL CAPTURE
+
         if (direction is not None and direction not in {"long", "short"}) or conf is None:
             return {"ok": False, "reason": "ml_missing_keys", "raw": out}
             
-        return {"ok": True, "dir": direction, "conf": float(conf), "reason": "ok", "raw": out}
+        return {"ok": True, "dir": direction, "conf": float(conf), "reason": "ok", "raw": out, "model_name": model_name} # <-- CRITICAL RETURN ADDITION
     except Exception as e:
         return {"ok": False, "reason": f"ml_exception:{type(e).__name__}"}
 
@@ -287,10 +295,13 @@ def generate_signals():
             ml = _infer_ml(asset, strategy=target_strategy)
             
             if not ml.get("ok"):
-                print(f"   >> ML FAILED: {ml.get('reason')}")
+                print(f"   >> ML FAILED: {ml.get('reason')}")
             else:
                 d_str = ml['dir'].upper() if ml['dir'] else "HOLD"
-                print(f"   >> [ML PREDICTION] {d_str} ({ml['conf']:.2f}) using {target_strategy}")
+                model_name = ml.get("model_name", "N/A") # <-- CAPTURE MODEL NAME
+                
+                # CRITICAL CHANGE: Updated print statement to include the algorithm name
+                print(f"   >> [ML PREDICTION] {d_str} ({ml['conf']:.2f}) using {target_strategy} ({model_name})") 
 
             gov = load_governance_params(asset)
             
@@ -300,11 +311,11 @@ def generate_signals():
                 confidence = float(ml["conf"] or 0.0)
                 
                 if direction is None:
-                    print("   >> ML Decision: HOLD/CASH (No Signal Generated)")
+                    print("   >> ML Decision: HOLD/CASH (No Signal Generated)")
                     continue
 
                 if confidence < float(gov["conf_min"]): 
-                    print(f"   >> ML Filtered: Confidence {confidence:.2f} < Min {gov['conf_min']}")
+                    print(f"   >> ML Filtered: Confidence {confidence:.2f} < Min {gov['conf_min']}")
                     continue
                 
                 # --- SIZING LOGIC ---
@@ -319,8 +330,9 @@ def generate_signals():
                     "direction": direction,
                     "confidence_score": confidence,
                     "confidence_label": label_confidence(confidence),
-                    "regime": current_regime,            
-                    "strategy": target_strategy,         
+                    "regime": current_regime, 
+                    "strategy": target_strategy, 
+                    "model_name": ml.get("model_name", "N/A"), # <-- ADD MODEL NAME TO SIGNAL DICT
                     "trade_size_limit": trade_dollars, 
                     "price_change": price_change,
                     "volume": volume,
@@ -333,13 +345,13 @@ def generate_signals():
                 try:
                     is_valid = is_signal_valid(signal)
                 except Exception as e:
-                    print(f"   >> CRITICAL: Signal Filter Crashed: {e}. Defaulting to True.")
+                    print(f"   >> CRITICAL: Signal Filter Crashed: {e}. Defaulting to True.")
                     is_valid = True
 
                 if is_valid:
                     dispatch_alerts(asset, signal, cache)
                     valid_signals.append(signal)
-                    print(f"   >> [LIVE SIGNAL GENERATED] {direction}")
+                    print(f"   >> [LIVE SIGNAL GENERATED] {direction}")
                     
                     if _broker and current_price > 0:
                         action = "BUY" if direction.lower() == "long" else "SELL"
@@ -349,35 +361,36 @@ def generate_signals():
                             can_trade = check_broker_cooldown(_broker, minutes=10)
                             
                             if not can_trade:
-                                print(f"   >> [SKIPPED] Cooldown Active (Last trade < 10 mins ago)")
+                                print(f"   >> [SKIPPED] Cooldown Active (Last trade < 10 mins ago)")
                             elif exposure_pct >= MAX_ALLOCATION:
-                                print(f"   >> [SKIPPED] Max Allocation Reached ({exposure_pct*100:.1f}%)")
+                                print(f"   >> [SKIPPED] Max Allocation Reached ({exposure_pct*100:.1f}%)")
                             elif trade_dollars < MIN_TRADE_DOLLARS:
-                                print(f"   >> [SKIPPED] Insufficient Cash for Min Trade (${available_cash:.2f})")
+                                print(f"   >> [SKIPPED] Insufficient Cash for Min Trade (${available_cash:.2f})")
                             else:
                                 qty = trade_dollars / current_price
-                                print(f"   >> [EXECUTING] {action} {qty:.6f} {asset} (${trade_dollars:.2f})")
+                                print(f"   >> [EXECUTING] {action} {qty:.6f} {asset} (${trade_dollars:.2f})")
                                 executed = _broker.execute_trade(action, qty, current_price)
                                 if executed:
                                     equity = _broker.get_portfolio_value(current_price)
-                                    print(f"   >> [PORTFOLIO] Cash: ${round(_broker.cash, 2)} | Equity: ${round(equity, 2)}")
+                                    print(f"   >> [PORTFOLIO] Cash: ${round(_broker.cash, 2)} | Equity: ${round(equity, 2)}")
                         
                         elif action == "SELL":
                             if _broker.positions > 0:
                                 qty = _broker.positions
-                                print(f"   >> [EXECUTING] {action} {qty:.6f} {asset} (CLOSE POSITION)")
+                                print(f"   >> [EXECUTING] {action} {qty:.6f} {asset} (CLOSE POSITION)")
                                 executed = _broker.execute_trade(action, qty, current_price)
                                 if executed:
                                     equity = _broker.get_portfolio_value(current_price)
-                                    print(f"   >> [PORTFOLIO] Cash: ${round(_broker.cash, 2)} | Equity: ${round(equity, 2)}")
+                                    print(f"   >> [PORTFOLIO] Cash: ${round(_broker.cash, 2)} | Equity: ${round(equity, 2)}")
                             else:
-                                print("   >> [SKIPPED] No position to sell.")
+                                print("   >> [SKIPPED] No position to sell.")
 
                 else:
-                    print(f"   >> [SIGNAL REJECTED] Filter Blocked (Vol: {volume}, Change: {price_change:.2f}%)")
+                    print(f"   >> [SIGNAL REJECTED] Filter Blocked (Vol: {volume}, Change: {price_change:.2f}%)")
 
     except Exception as e:
         print(f"Generator Exception: {e}")
+        failure_tracker.record_failure("signal_generator", str(e))
 
     return valid_signals
 

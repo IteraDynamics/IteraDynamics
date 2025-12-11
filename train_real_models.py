@@ -8,6 +8,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score
+import pandas_ta as ta 
 
 # 1. Setup Paths
 # We need to save the models where Moonwire looks for them
@@ -27,12 +28,34 @@ if not data_path.exists():
 df = pd.read_csv(data_path)
 print(f"   Loaded {len(df)} rows of history.")
 
+# --- NEW FEATURE CALCULATION SECTION (ROBUST) ---
+# This calculates the required technical indicators based on raw OHLCV data.
+df['RSI'] = ta.rsi(df['Price'], length=14)
+
+# Calculate Bollinger Bands (BB)
+bband = ta.bbands(df['Price'], length=20, std=2)
+
+# DYNAMIC COLUMN FINDER: Finds the correct column names automatically
+# This prevents KeyErrors whether the lib returns 'BBL_20_2.0' or 'BBL_20_2'
+lower_col = next(c for c in bband.columns if c.startswith("BBL"))
+upper_col = next(c for c in bband.columns if c.startswith("BBU"))
+
+print(f"   DEBUG: Using BB Cols -> Lower: {lower_col}, Upper: {upper_col}")
+
+# BB_Pos: Position relative to the bands
+df['BB_Pos'] = (df['Price'] - bband[lower_col]) / (bband[upper_col] - bband[lower_col])
+
+# Vol_Z (Volatility Z-Score): A simple Z-score of volume
+df['Vol_Z'] = (df['Volume'] - df['Volume'].rolling(20).mean()) / df['Volume'].rolling(20).std()
+# --- END NEW FEATURE CALCULATION SECTION ---
+
+
 # --- Feature Engineering ---
 # We use the exact features your system is already calculating:
 # RSI, BB_Pos (Bollinger Band Position), Vol_Z (Volatility Z-Score)
 feature_cols = ['RSI', 'BB_Pos', 'Vol_Z']
 
-# Drop any rows where these features are missing
+# Drop any rows where these features are missing (mainly the initial 20 rows needed for calculation)
 df = df.dropna(subset=feature_cols)
 
 # --- Define the Target (The "Truth") ---

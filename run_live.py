@@ -1,9 +1,12 @@
 import time
 import subprocess
-import sys
-import os
 import requests
 from datetime import datetime
+import sys
+if sys.platform == "win32":
+    import os
+    # Set console encoding to UTF-8 for clean printing of special characters
+    os.system('chcp 65001')
 
 # --- CONFIGURATION ---
 INTERVAL = 60 

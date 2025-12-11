@@ -1,14 +1,16 @@
-# signal_engine/ml/infer.py
+# apex_core\signal_engine\ml\infer.py
 from __future__ import annotations
 import sys
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
+import os # <-- ADDED: Need os for path resolution later
 
 # --- Bridge to Moonwire ---
 try:
     current = Path(__file__).resolve()
+    # Assuming standard monorepo path: apex_core/signal_engine/ml/infer.py
     root_dir = current.parents[3] 
     if not (root_dir / "moonwire").exists():
         root_dir = Path(os.getcwd())
@@ -66,6 +68,7 @@ def infer_asset_signal(symbol: str, strategy: str = None) -> Dict[str, Any]:
         adapter = MLStrategyAdapter(symbol, models_dir=models_path)
         
         # --- AMNESIA FIX: PRELOAD HISTORY ---
+        # The 'amnesia fix' is a temporary way to pass history to the adapter
         if df is not None and not df.empty:
             history = df['Price'].tail(100).tolist()
             if len(history) > 1:
@@ -73,6 +76,27 @@ def infer_asset_signal(symbol: str, strategy: str = None) -> Dict[str, Any]:
         # ------------------------------------
 
         result = adapter.analyze(current_price, strategy=strategy)
+
+        # === START CRITICAL LOGGING CHANGE (Task 2) ===
+        # We assume the model filename is returned in result.metadata.model_filename
+        
+        model_name = "Model Not Logged"
+        
+        # Heuristic: Extract model name from filename (e.g., random_forest.pkl -> Random Forest)
+        if result.get("metadata") and result.get("metadata").get("model_filename"):
+            filename = result.get("metadata").get("model_filename").lower()
+            if "random_forest" in filename:
+                model_name = "Random Forest"
+            elif "gradient_boost" in filename:
+                model_name = "Gradient Boost"
+            elif "logistic_regression" in filename:
+                model_name = "Logistic Regression"
+            elif "svm" in filename:
+                model_name = "SVM"
+            # Fallback for unexpected filenames
+            else:
+                model_name = filename.replace(".pkl", "").replace("_", " ").title()
+        # === END CRITICAL LOGGING CHANGE ===
 
         # 3. Translate
         direction_map = {"BUY": "long", "SELL": "short", "HOLD": None}
@@ -85,10 +109,12 @@ def infer_asset_signal(symbol: str, strategy: str = None) -> Dict[str, Any]:
             "direction": direction,
             "confidence": confidence,
             "reason": result.get("reason", "ok"),
+            "model_name": model_name, # CRITICAL ADDITION for the log
             "metadata": result
         }
 
     except Exception as e:
+        logger.error("Inference Engine Exception: %s", e)
         return {"ok": False, "reason": f"Exception: {e}"}
 
 __all__ = ['InferenceEngine', 'infer_asset_signal', 'vectorize_features']
