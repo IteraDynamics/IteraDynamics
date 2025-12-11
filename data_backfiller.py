@@ -9,10 +9,10 @@ from pathlib import Path
 # Target exchange (Coinbase Pro is reliable for historical data)
 EXCHANGE_ID = 'coinbase' 
 SYMBOL = 'BTC/USD'
-TIMEFRAME = '1m'  # 1-minute candles
-START_DATE = datetime(2024, 1, 1) # Target start date for history
+TIMEFRAME = '1h'  # <-- CHANGED: Zooming out to Hourly candles
+START_DATE = datetime(2020, 1, 1) # <-- CHANGED: Grabbing 4+ years of history (The full Cycle)
 OUTPUT_FILE = Path("flight_recorder.csv")
-LIMIT = 1000 # Max candles per API call
+LIMIT = 300 # Max candles per API call (Coinbase limit is usually 300 for 1h)
 
 def fetch_data(exchange, symbol, timeframe, start_timestamp, limit):
     """Fetches a chunk of OHLCV data."""
