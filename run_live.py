@@ -1,15 +1,15 @@
 import time
 import subprocess
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
+import os
+
 if sys.platform == "win32":
     import os
-    # Set console encoding to UTF-8 for clean printing of special characters
     os.system('chcp 65001')
 
 # --- CONFIGURATION ---
-INTERVAL = 60 
 SYMBOL = "bitcoin"
 
 def log(message):
@@ -30,6 +30,7 @@ def get_live_price_display():
         return 0.0
 
 def run_argus():
+    log("🚀 EXECUTION WINDOW OPEN: Waking Argus...")
     try:
         env = os.environ.copy()
         env["MW_INFER_LIVE"] = "1"
@@ -55,26 +56,50 @@ def run_argus():
         if relevant_lines:
             for line in relevant_lines:
                 log(f"   {line.strip()}")
+        else:
+            # If no relevant output, show raw to debug
+            log(f"   [RAW OUTPUT] {result.stdout[:200]}...")
         
         if result.stderr:
             clean_err = result.stderr.strip()
-            # Filter out the harmless INFO logs
             if clean_err and "INFO" not in clean_err:
                 log(f"   [STDERR] ⚠️ {clean_err}")
                 
     except Exception as e:
         log(f"❌ Execution Error: {e}")
+    
+    log("💤 Argus cycle complete. Sleeping...")
 
 if __name__ == "__main__":
-    log("=== 🚀 Itera Dynamics: LIVE ALPHA (CLEAN DASHBOARD) ===")
+    log("=== 🚀 Itera Dynamics: LIVE HOURLY SCHEDULER ===")
+    log("    Mode: Hourly Swing (Execution at XX:00)")
     
+    last_run_hour = -1
+
     try:
         while True:
+            now = datetime.now()
             price = get_live_price_display()
-            if price > 0:
-                log(f"Tick: ${price:,.2f}")
-            run_argus()
-            time.sleep(INTERVAL)
+            
+            # 1. TRIGGER LOGIC (Top of the Hour)
+            # We check if minute is 0 AND we haven't run this hour yet
+            if now.minute == 0 and now.hour != last_run_hour:
+                # Wait 10 seconds to ensure candle closes on the exchange
+                time.sleep(10) 
+                run_argus()
+                last_run_hour = now.hour
+                
+            # 2. HEARTBEAT (Every ~60 seconds)
+            else:
+                # Calculate time to next signal
+                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                minutes_left = (next_hour - now).total_seconds() / 60
+                
+                if price > 0:
+                    print(f"[{now.strftime('%H:%M')}] Tick: ${price:,.2f} | ⏳ Signal in {int(minutes_left)}m")
+            
+            # Sleep 30s to stay responsive but not burn CPU
+            time.sleep(30)
             
     except KeyboardInterrupt:
         log("=== Session Ended by User ===")
