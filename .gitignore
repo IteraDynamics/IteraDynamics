@@ -10,6 +10,8 @@ paper_test.json
 *.log
 *.csv
 *.pkl
+secrets.py
+vault.py
 
 # Cursor/VSCode settings
 .vscode/
