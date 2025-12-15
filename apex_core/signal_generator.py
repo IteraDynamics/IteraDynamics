@@ -57,14 +57,14 @@ def update_market_data(csv_path: Path = Path("flight_recorder.csv")):
             return
 
         df = pd.read_csv(csv_path)
-        last_timestamp = pd.to_datetime(df['Timestamp']).max()
+        last_timestamp = pd.to_datetime(df['Timestamp'], format='mixed').max()
         
         new_rows = []
         for candle in data:
             ts = datetime.fromtimestamp(candle[0])
             if ts > last_timestamp:
                 new_rows.append({
-                    'Timestamp': ts,
+                    'Timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'),
                     'Open': candle[3],
                     'High': candle[2],
                     'Low': candle[1],
@@ -88,7 +88,7 @@ def get_latest_features(csv_path: Path = Path("flight_recorder.csv")):
     """
     try:
         df = pd.read_csv(csv_path)
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], format='mixed')
         df.sort_values('Timestamp', inplace=True)
         
         # --- FEATURE ENGINEERING (Must match train_real_models.py) ---
