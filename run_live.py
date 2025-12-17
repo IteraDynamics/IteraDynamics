@@ -1,89 +1,66 @@
 # run_live.py
-# 🦅 ARGUS HOURLY SCHEDULER - V3.0 (LOGGING ENABLED)
+# 🦅 ARGUS LIVE SCHEDULER - V2.0 (LOGGING ENABLED)
 
-import schedule
 import time
-import subprocess
+import schedule
 import sys
 import os
 from datetime import datetime
-import logging
-from pathlib import Path
+from apex_core.signal_generator import generate_signals
 
-# --- GLOBAL LOGGING SETUP ---
-LOG_FILE = Path("data/argus_execution.log")
+# --- 🔧 LOGGER CLASS ---
+class Logger(object):
+    def __init__(self):
+        self.terminal = sys.stdout
+        self.log = open("argus.log", "a", encoding="utf-8") # Append mode
 
-# Ensure the 'data' directory exists
-LOG_FILE.parent.mkdir(exist_ok=True)
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush() # Ensure dashboard sees it immediately
 
-# Configure the global logger (Writes to file AND console)
-# We use a simple format for the log file itself.
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s', 
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# Redirect stdout and stderr to the logger
+sys.stdout = Logger()
+sys.stderr = sys.stdout
 
 def job():
-    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 EXECUTION WINDOW OPEN: Waking Argus...")
+    """ The Hourly Mission """
+    # 1. VISUAL SPACER
+    print(f"\n[2025-12-17 {datetime.now().strftime('%H:%M:%S')}] 🚀 EXECUTION WINDOW OPEN: Waking Argus...")
     
-    # 🔧 FORCE UTF-8 ENCODING FOR THE SUBPROCESS
-    my_env = os.environ.copy()
-    my_env["PYTHONIOENCODING"] = "utf-8"
-
+    # 2. RUN BRAIN
     try:
-        result = subprocess.run(
-            [sys.executable, "apex_core/signal_generator.py"], 
-            capture_output=True, 
-            text=True,
-            encoding='utf-8', 
-            env=my_env 
-        )
-
-        # Log Standard Output (Logs from the bot)
-        if result.stdout:
-            # Clean up raw output line-by-line before logging
-            for line in result.stdout.strip().split('\n'):
-                # We log the raw output directly, which contains the timestamp/message we want
-                logger.info(line.strip())
-
-        # Log Errors (if any)
-        if result.stderr:
-            logger.error(f"   [STDERR] {result.stderr}")
-            
+        generate_signals()
     except Exception as e:
-        logger.error(f"   ❌ CRITICAL SCHEDULER ERROR: {e}")
+        print(f"❌ CRITICAL SCHEDULER ERROR: {e}")
+    
+    # 3. SLEEP MESSAGE
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 💤 Argus cycle complete. Sleeping...")
+    
+    # 4. NEXT EXECUTION TIME
+    next_run = schedule.next_run()
+    if next_run:
+        wait_mins = (next_run - datetime.now()).total_seconds() / 60
+        print(f"[{datetime.now().strftime('%H:%M')}] ⏳ Next Signal in {int(wait_mins)} min...")
 
-    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 💤 Argus cycle complete. Sleeping...")
-
-def get_market_price():
-    # Retained placeholder function
-    return "Active"
-
-# --- SCHEDULING ---
+# --- SCHEDULE ---
+# Run every hour at :00 minutes
 schedule.every().hour.at(":00").do(job)
 
-logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] === 🚀 Itera Dynamics: LIVE HOURLY SCHEDULER ===")
-logger.info(f"[ SYSTEM ] Encoding Forced: UTF-8")
-logger.info(f"           Mode: Hourly Swing (Execution at XX:00)")
-
-while True:
-    next_run = schedule.next_run()
-    time_left = next_run - datetime.now()
-    minutes = int(time_left.total_seconds() // 60)
+if __name__ == "__main__":
+    print("🦅 ARGUS LIVE SCHEDULER ONLINE")
+    print("--------------------------------")
+    print(f"⏰ System Time: {datetime.now().strftime('%H:%M:%S')}")
+    print("Waiting for next hourly slot...")
     
-    # Use print for the simple, one-line status update (it's fast and doesn't spam the log file)
-    print(f"\r[{datetime.now().strftime('%H:%M')}] ⏳ Next Signal in {minutes} min...   ", end="")
+    # Run once immediately on launch for verification?
+    # Uncomment next line if you want an instant check
+    # job() 
     
-    try:
-        time.sleep(60)
-    except KeyboardInterrupt:
-        logger.warning("\n🛑 SCHEDULER STOPPED BY USER.")
-        break
-    
-    schedule.run_pending()
+    while True:
+        schedule.run_pending()
+        time.sleep(1)

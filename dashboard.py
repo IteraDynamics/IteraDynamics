@@ -1,217 +1,259 @@
-# src/dashboard.py
-# 🦅 ARGUS MISSION CONTROL - V6.2 (FINAL VERBOSE LOG FIX)
-# Reads the verbose argus_execution.log file.
+# dashboard.py
+# 🦅 ARGUS MISSION CONTROL - V2.3 (CLEAN LOGS FIX)
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+import time
+import requests
 import json
-import re
+from pathlib import Path
+from dotenv import load_dotenv
 import sys
 import os
-import time
-from datetime import datetime
-import plotly.graph_objects as go
-from pathlib import Path
 
-# --- CONNECT TO REAL BROKER ---
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# --- PATH SETUP ---
+current_file = Path(__file__).resolve()
+project_root = current_file.parent 
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
+load_dotenv(project_root / ".env")
+
+# --- IMPORT LIVE BROKER ---
 try:
     from src.real_broker import RealBroker
-    BROKER_AVAILABLE = True
-except Exception as e:
-    BROKER_AVAILABLE = False
-    BROKER_ERROR = e
+except ImportError:
+    st.error("❌ Could not import RealBroker. Check path.")
+    st.stop()
 
-# --- CONFIGURATION ---
-CHART_FILE = Path("data/flight_recorder.csv") # Used for the performance curve
-EXECUTION_LOG = Path("data/argus_execution.log") # Used for the terminal log display
+st.set_page_config(
+    page_title="Argus Commander",
+    page_icon="🦅",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-st.set_page_config(page_title="Argus Mission Control", page_icon="🦅", layout="wide")
-
-# --- CUSTOM CSS (FINAL CROSS-BROWSER FIX) ---
+# --- CUSTOM STYLING ---
+# FIX: Removed invalid Python comments (#) from CSS block
+# Increased font size and line height for better legibility
 st.markdown("""
-    <style>
-    /* 1. Main Background */
-    .stApp { background-color: #0E1117; }
-    
-    /* 2. Metric Styling */
-    [data-testid="stMetricLabel"] {
-        font-size: 16px !important; color: #FFFFFF !important; font-weight: 700 !important; opacity: 1 !important;
-    }
+<style>
+    .stApp { background-color: #0e1117; }
     [data-testid="stMetricValue"] {
-        font-family: "Source Code Pro", monospace; font-size: 32px !important; color: #00FF88 !important;
+        font-size: 26px;
+        font-family: 'Monospace';
+        color: #00ff00;
     }
-    
-    /* 3. Headers */
-    h1, h2, h3 { color: #FFFFFF !important; font-weight: 800 !important; }
-    
-    /* 4. Chart Transparency */
-    .js-plotly-plot .plotly .main-svg { background: rgba(0,0,0,0) !important; }
-    
-    /* 5. FINAL FIX: Target the container of the code block for cross-browser consistency */
-    div.stCodeBlock {
-        background-color: #1a1a1a !important; /* Dark background for the outer container */
-        border: 1px solid #333 !important;
-        border-radius: 5px !important;
-        max-height: 400px;
+    div[data-testid="stMetricLabel"] > label {
+        color: #888;
+        font-size: 14px;
+    }
+    .log-box {
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+        line-height: 1.5;
+        color: #00ff00;
+        background-color: #000000;
+        padding: 15px;
+        border: 1px solid #333;
+        border-radius: 5px;
+        height: 350px;
         overflow-y: scroll;
-        padding: 15px; /* Add padding inside the container */
+        white-space: pre-wrap;
     }
+</style>
+""", unsafe_allow_html=True)
 
-    /* 6. Target the text inside the code block */
-    code, pre {
-        font-family: 'Source Code Pro', monospace !important;
-        font-size: 12px !important;
-        color: #cccccc !important; /* Light grey text */
-        background-color: transparent !important; /* Crucial: make the text background transparent */
-        border: none !important; /* Remove internal border */
-    }
-    </style>
-    """, unsafe_allow_html=True)
+# --- LIVE DATA FUNCTIONS ---
 
-# --- LIVE DATA ENGINE ---
-def get_live_data():
-    """Connects to RealBroker to get ACTUAL wallet balance."""
-    if not BROKER_AVAILABLE:
-        return 0.0, 0.0, f"Broker Import Failed: {BROKER_ERROR}"
-    
+@st.cache_resource
+def get_broker():
+    """ Connect to Broker once """
+    return RealBroker()
+
+def get_live_price():
+    """ 
+    🎯 DIRECT HIT to Coinbase Public API for instant price. 
+    Bypasses CSV and Broker logic to ensure accuracy.
+    """
     try:
-        broker = RealBroker()
-        cash = broker.cash
-        btc_qty = broker.positions
-        return cash, btc_qty, "CONNECTED"
-    except Exception as e:
-        return 0.0, 0.0, f"Connection Error: {e}"
-
-def get_live_ticker():
-    """Fetches the REAL-TIME price of BTC from Coinbase."""
-    if not BROKER_AVAILABLE: return 0.0
-    try:
-        broker = RealBroker()
-        product = broker.client.get_product("BTC-USD")
-        
-        if hasattr(product, 'price'):
-            return float(product.price)
-        elif isinstance(product, dict):
-            return float(product.get('price', 0))
+        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+        resp = requests.get(url, timeout=3)
+        data = resp.json()
+        return float(data['data']['amount'])
+    except Exception:
         return 0.0
-    except:
-        return 87150.00 
 
-def scrape_equity_curve():
-    """Builds chart from CSV logs."""
-    if not CHART_FILE.exists(): return None
-    try:
-        df = pd.read_csv(CHART_FILE)
-        if 'Timestamp' in df.columns and 'Equity' in df.columns:
-            df['dt'] = pd.to_datetime(df['Timestamp'])
-            if 'Equity' not in df.columns: return None 
+def load_market_data():
+    """ Reads CSV for the chart history only """
+    csv_path = project_root / "flight_recorder.csv"
+    if csv_path.exists():
+        try:
+            # Handle variable columns if header exists or not
+            df = pd.read_csv(csv_path)
+            # If columns don't match expected, force rename (safety)
+            if 'Close' not in df.columns:
+                 df = pd.read_csv(csv_path, names=["Timestamp","Open","High","Low","Close","Volume"], header=0)
+            
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+            df.sort_values('Timestamp', inplace=True)
             return df
-    except: return None
-    return None
+        except:
+            pass
+    return pd.DataFrame()
 
-# --- VISUALIZATION HELPERS (Unchanged) ---
-def create_equity_chart(df):
-    fig = go.Figure()
-    if df is not None and not df.empty:
-        fig.add_trace(go.Scatter(x=df['dt'], y=df['Equity'], mode='lines', name='Equity',
-            line=dict(color='#00FF88', width=3), fill='tozeroy', fillcolor='rgba(0, 255, 136, 0.05)'))
-        min_y = df['Equity'].min(); max_y = df['Equity'].max()
-        buffer = (max_y - min_y) * 0.5 if max_y != min_y else 50
-        fig.update_layout(yaxis=dict(range=[min_y - buffer, max_y + buffer]))
-    
-    fig.update_layout(template="plotly_dark", height=350, margin=dict(l=0, r=0, t=10, b=0),
-        font=dict(color="white"), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-        yaxis=dict(showgrid=True, gridcolor='#333333'),
-        xaxis=dict(showgrid=False, linecolor='#333333'))
-    return fig
+def read_logs():
+    """ Robust Log Reader """
+    log_path = project_root / "argus.log"
+    if log_path.exists():
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                # Read last 50 lines to keep it snappy
+                lines = f.readlines()
+                return "".join(lines[-50:])
+        except:
+            return "Error reading log file."
+    return "Waiting for Scheduler to start..."
 
-def make_gauge(confidence):
-    fig = go.Figure(go.Indicator(mode = "gauge+number", value = confidence * 100,
-        number = {'suffix': "%", 'font': {'color': "white", 'size': 24}},
-        title = {'text': "AI CONVICTION", 'font': {'size': 16, 'color': "white"}},
-        gauge = {'axis': {'range': [0, 100], 'tickcolor': "white"}, 'bar': {'color': "#636EFA"},
-            'bgcolor': "#0E1117", 'borderwidth': 2, 'bordercolor': "#333",
-            'steps': [{'range': [0, 50], 'color': "rgba(239, 85, 59, 0.3)"},
-                      {'range': [50, 70], 'color': "rgba(255, 205, 86, 0.3)"},
-                      {'range': [70, 100], 'color': "rgba(0, 204, 150, 0.3)"}],
-            'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': 70}}))
-    fig.update_layout(height=280, margin=dict(l=30, r=30, t=50, b=20), paper_bgcolor="rgba(0,0,0,0)")
-    return fig
+def get_cortex_state():
+    """ Reads the latest brain state from JSON """
+    json_path = project_root / "cortex.json"
+    if json_path.exists():
+        try:
+            with open(json_path, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    # Default fallback if no file yet
+    return {"conviction_score": 50, "regime": "Waiting...", "risk_mult": 0.0}
 
 # --- MAIN DASHBOARD ---
-st.title("🦅 Argus | Mission Control")
-
-if st.button("🔄 Force Refresh"): st.rerun()
-
-# 1. LIVE DATA FETCH
-cash, btc_bal, sys_status = get_live_data()
-live_price = get_live_ticker() 
-history_df = scrape_equity_curve() 
-
-if live_price == 0: live_price = 87150.00
-
-# 2. STATUS BAR
-if sys_status == "CONNECTED": 
-    st.success(f"🟢 **SYSTEM ONLINE** | Market Feed Active")
-else: 
-    st.error(f"🔴 **SYSTEM ERROR** | {sys_status}")
-
-st.markdown("---")
-
-# 3. METRICS
-equity = cash + (btc_bal * live_price)
-crypto_val = btc_bal * live_price
-total_return = ((equity - 100.00) / 100.00) * 100 
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Net Liquid Equity", f"${equity:,.2f}", f"{total_return:.2f}%")
-c2.metric("Dry Powder (USD)", f"${cash:,.2f}")
-c3.metric("BTC Exposure", f"${crypto_val:,.2f}", f"{btc_bal:.6f} BTC")
-c4.metric("Live Market Price", f"${live_price:,.2f}")
-
-st.markdown("---")
-
-# 4. VISUALIZATION
-col_chart, col_brain = st.columns([2, 1])
-with col_chart:
-    st.subheader("Performance Curve")
-    if history_df is not None and not history_df.empty:
-        st.plotly_chart(create_equity_chart(history_df), use_container_width=True)
-    else: 
-        st.info("Initializing Data Stream... (Chart will appear after first trade)")
-        st.plotly_chart(create_equity_chart(None), use_container_width=True)
-
-with col_brain:
-    st.subheader("Cortex State")
-    st.plotly_chart(make_gauge(0.50), use_container_width=True) 
-    st.caption(f"Strategy Signal: **WAITING**")
-
-# 5. SCROLLABLE TERMINAL LOGS
-st.markdown("---")
-st.subheader("📜 System Logs (Live Stream)")
-
-log_content = "Waiting for logs..."
-
-# --- FIXED: Reading the VERBOSE EXECUTION_LOG ---
-if EXECUTION_LOG.exists():
+def main():
+    st.title("🦅 ARGUS // LIVE COMMANDER")
+    
+    # 1. FETCH DATA
     try:
-        if EXECUTION_LOG.stat().st_size > 0:
-            with open(EXECUTION_LOG, "r", encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-                log_content = "".join(lines[-50:]) 
-            
-            st.code(log_content, language='log')
-            
+        broker = get_broker()
+        cash = broker.cash
+        btc_bal = broker.positions
+        
+        # Live Price from API
+        current_price = get_live_price()
+        
+        # Chart History
+        df = load_market_data()
+
+        # Equity Math
+        equity = cash + (btc_bal * current_price)
+        
+        # Sidebar Entry
+        avg_entry = st.sidebar.number_input("Avg Entry Price (Cost Basis)", value=90163.00) 
+        
+        # PnL Math
+        if btc_bal > 0:
+            unrealized_pnl_usd = (current_price - avg_entry) * btc_bal
+            pnl_pct = (unrealized_pnl_usd / (avg_entry * btc_bal)) * 100
+            breakeven = avg_entry * 1.006 # 0.6% fees
         else:
-            st.info("Execution log found, but is currently empty.")
+            unrealized_pnl_usd = 0.0
+            pnl_pct = 0.0
+            breakeven = 0.0
 
     except Exception as e:
-        st.error(f"Error reading log file: {e}")
-else:
-    st.info(log_content)
+        st.error(f"System Error: {e}")
+        return
 
-# Auto-Refresh
-time.sleep(30)
-st.rerun()
+    # --- ROW 1: LIQUID STATUS ---
+    st.markdown("### 🏦 Liquid Status")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Net Liquid Equity", f"${equity:,.2f}", delta=f"{unrealized_pnl_usd:+.2f}")
+    k2.metric("Dry Powder (USD)", f"${cash:,.2f}")
+    k3.metric("BTC Exposure", f"${(btc_bal * current_price):,.2f}", f"{btc_bal:.6f} BTC")
+    k4.metric("Market Price", f"${current_price:,.2f}")
+
+    # --- ROW 2: ACTIVE POSITION ANALYSIS ---
+    st.markdown("### 📊 Active Position Analysis")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Avg Entry Price", f"${avg_entry:,.2f}")
+    m2.metric("Unrealized P&L ($)", f"${unrealized_pnl_usd:+.2f}")
+    
+    color_mode = "normal" if pnl_pct >= 0 else "inverse"
+    m3.metric("Unrealized P&L (%)", f"{pnl_pct:+.2f}%", delta=pnl_pct, delta_color=color_mode)
+    
+    m4.metric("Breakeven Price", f"${breakeven:,.2f}")
+
+    st.markdown("---")
+
+    # --- ROW 3: CHARTS & GAUGE ---
+    c1, c2 = st.columns([3, 1])
+    
+    with c1:
+        st.subheader("Performance Curve")
+        if not df.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df['Timestamp'], y=df['Close'], 
+                mode='lines', name='BTC', 
+                line=dict(color='#00ff00', width=2)
+            ))
+            fig.update_layout(
+                template="plotly_dark", 
+                paper_bgcolor='rgba(0,0,0,0)', 
+                plot_bgcolor='rgba(0,0,0,0)',
+                height=350,
+                margin=dict(l=0, r=0, t=20, b=0)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Waiting for Flight Recorder Data...")
+
+    with c2:
+        st.subheader("Cortex State")
+        
+        # READ LIVE STATE FROM JSON
+        cortex = get_cortex_state()
+        score = cortex.get("conviction_score", 50)
+        regime_label = cortex.get("regime", "Unknown")
+
+        fig_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number",
+            value = score, 
+            title = {'text': "AI Conviction"},
+            gauge = {
+                'axis': {'range': [None, 100]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [0, 40], 'color': "red"},
+                    {'range': [40, 60], 'color': "gray"},
+                    {'range': [60, 100], 'color': "green"}],
+            }
+        ))
+        
+        # Add the text label below the gauge
+        fig_gauge.add_annotation(
+            x=0.5, y=-0.2,
+            text=regime_label,
+            showarrow=False,
+            font=dict(size=12, color="gray")
+        )
+        
+        fig_gauge.update_layout(
+            height=300, 
+            margin=dict(l=20, r=20, t=50, b=40), 
+            paper_bgcolor='rgba(0,0,0,0)',
+            font={'color': "white"}
+        )
+        st.plotly_chart(fig_gauge, use_container_width=True)
+
+    # --- ROW 4: LOGS (FIXED CSS) ---
+    st.subheader("📜 System Logs (Live Stream)")
+    logs_content = read_logs()
+    st.markdown(f"<div class='log-box'>{logs_content}</div>", unsafe_allow_html=True)
+
+    # Auto-Refresh
+    time.sleep(10)
+    st.rerun()
+
+if __name__ == "__main__":
+    main()

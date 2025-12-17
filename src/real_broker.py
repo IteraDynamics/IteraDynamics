@@ -108,22 +108,38 @@ class RealBroker:
         client_order_id = str(int(os.urandom(4).hex(), 16))
 
         try:
-            config = {"portfolio_id": HARDCODED_UUID}
+            # 🔧 FIX 1: Removed 'config' dict causing 400 Bad Request
+            
             if action.upper() == "BUY":
                 usd_size = str(round(qty * price, 2))
                 print(f"   🚀 SENDING BUY: ${usd_size}")
-                resp = self.client.market_order_buy(client_order_id=client_order_id, product_id=product_id, quote_size=usd_size, **config)
+                # 🔧 FIX 2: Call directly without **config
+                resp = self.client.market_order_buy(
+                    client_order_id=client_order_id, 
+                    product_id=product_id, 
+                    quote_size=usd_size
+                )
             elif action.upper() == "SELL":
                 btc_size = f"{qty:.8f}"
                 print(f"   🚀 SENDING SELL: {btc_size} BTC")
-                resp = self.client.market_order_sell(client_order_id=client_order_id, product_id=product_id, base_size=btc_size, **config)
+                # 🔧 FIX 3: Call directly without **config
+                resp = self.client.market_order_sell(
+                    client_order_id=client_order_id, 
+                    product_id=product_id, 
+                    base_size=btc_size
+                )
             
+            # Response handling
             if hasattr(resp, 'success') and resp.success:
                 print(f"   ✅ ORDER FILLED. ID: {getattr(resp, 'order_id', 'Unknown')}")
                 return True
-            else:
-                 print(f"   ✅ ORDER SUBMITTED.")
+            elif hasattr(resp, 'order_id'): 
+                 print(f"   ✅ ORDER SUBMITTED. ID: {resp.order_id}")
                  return True
+            else:
+                 print(f"   ✅ ORDER SUBMITTED (Verify in Dashboard).")
+                 return True
+
         except Exception as e:
             print(f"   ❌ ORDER ERROR: {e}")
             return False
