@@ -35,25 +35,37 @@ st.set_page_config(
 )
 
 # --- CUSTOM STYLING ---
-# FIX: Removed invalid Python comments (#) from CSS block
-# Increased font size and line height for better legibility
 st.markdown("""
 <style>
+    /* Main Background */
     .stApp { background-color: #0e1117; }
+    
+    /* HEADERS: Force H1, H2, H3 to be Pure White */
+    h1, h2, h3, h4, h5, h6 {
+        color: #ffffff !important;
+        font-family: 'Monospace';
+    }
+
+    /* METRIC VALUES (The Numbers): Neon Green */
     [data-testid="stMetricValue"] {
         font-size: 26px;
         font-family: 'Monospace';
         color: #00ff00;
     }
+
+    /* METRIC LABELS (The Text "Avg Entry"): Pure White */
     div[data-testid="stMetricLabel"] > label {
-        color: #888;
+        color: #ffffff !important; /* Fixed: Was gray, now bright white */
         font-size: 14px;
+        font-weight: bold;
     }
+
+    /* LOG BOX: Neon Green & 100% Visible */
     .log-box {
         font-family: 'Courier New', monospace;
         font-size: 14px;
         line-height: 1.5;
-        color: #00ff00;
+        color: #00ff00 !important;
         background-color: #000000;
         padding: 15px;
         border: 1px solid #333;
@@ -61,6 +73,14 @@ st.markdown("""
         height: 350px;
         overflow-y: scroll;
         white-space: pre-wrap;
+    }
+
+    /* UNIVERSAL LOG FIX: Force everything inside log-box to be bright */
+    .log-box * {
+        color: #00ff00 !important;
+        opacity: 1 !important;
+        background-color: transparent !important;
+        text-shadow: none !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -111,7 +131,7 @@ def read_logs():
             with open(log_path, "r", encoding="utf-8") as f:
                 # Read last 50 lines to keep it snappy
                 lines = f.readlines()
-                return "".join(lines[-50:])
+                return "".join(lines[-300:])
         except:
             return "Error reading log file."
     return "Waiting for Scheduler to start..."
