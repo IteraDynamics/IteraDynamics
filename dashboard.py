@@ -1,32 +1,47 @@
 # dashboard.py
-# 🦅 ARGUS MISSION CONTROL - V3.3 (RESTORED TO V2.3 BASELINE)
+# 🦅 ARGUS MISSION CONTROL - V3.4 (CORTEX.JSON AS SOURCE OF TRUTH)
+
+from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import time, requests, json, sys, os
+import time
+import requests
+import json
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-# --- PATH SETUP (V2.3 Original) ---
+
+# --- PATH SETUP ---
 current_file = Path(__file__).resolve()
-project_root = current_file.parent 
+project_root = current_file.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 load_dotenv(project_root / ".env")
 
-# --- IMPORT LIVE BROKER (V2.3 Original) ---
+
+# --- IMPORT LIVE BROKER ---
 try:
     from src.real_broker import RealBroker
 except ImportError:
     st.error("❌ Could not import RealBroker. Check path.")
     st.stop()
 
-st.set_page_config(page_title="Argus Commander", page_icon="🦅", layout="wide", initial_sidebar_state="collapsed")
 
-# --- CUSTOM STYLING (V2.3 Original CSS) ---
-st.markdown("""
+st.set_page_config(
+    page_title="Argus Commander",
+    page_icon="🦅",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+# --- CUSTOM STYLING ---
+st.markdown(
+    """
 <style>
     .stApp { background-color: #0e1117; }
     h1, h2, h3, h4, h5, h6 { color: #ffffff !important; font-family: 'Monospace'; }
@@ -40,73 +55,145 @@ st.markdown("""
     }
     .log-box * { color: #00ff00 !important; opacity: 1 !important; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
 
 # --- LIVE DATA FUNCTIONS ---
-
 @st.cache_resource
-def get_broker(): return RealBroker()
+def get_broker():
+    return RealBroker()
 
-def get_live_price():
+
+def get_live_price() -> float:
     try:
         url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
         resp = requests.get(url, timeout=3)
-        return float(resp.json()['data']['amount'])
-    except: return 0.0
+        return float(resp.json()["data"]["amount"])
+    except Exception:
+        return 0.0
 
-def load_market_data():
+
+def load_market_data() -> pd.DataFrame:
     csv_path = project_root / "flight_recorder.csv"
     if csv_path.exists():
         try:
             df = pd.read_csv(csv_path)
-            if 'Close' not in df.columns:
-                 df = pd.read_csv(csv_path, names=["Timestamp","Open","High","Low","Close","Volume"], header=0)
-            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-            df.sort_values('Timestamp', inplace=True)
+            if "Close" not in df.columns:
+                df = pd.read_csv(csv_path, names=["Timestamp", "Open", "High", "Low", "Close", "Volume"], header=0)
+            df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+            df.sort_values("Timestamp", inplace=True)
             return df
-        except: pass
+        except Exception:
+            pass
     return pd.DataFrame()
 
-def read_logs():
+
+def read_logs() -> str:
     log_path = project_root / "argus.log"
     if log_path.exists():
         try:
             with open(log_path, "r", encoding="utf-8") as f:
                 return "".join(f.readlines()[-300:])
-        except: return "Error reading log."
+        except Exception:
+            return "Error reading log."
     return "Waiting for logs..."
 
-# --- 🎯 AUTOMATION UPDATES ---
 
-def get_cortex_state():
-    """Reads Risk Multiplier from logs to drive the gauge."""
+# --- CORTEX STATE ---
+def _safe_float(x: str, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def get_cortex_state() -> dict:
+    """
+    Source of truth: cortex.json emitted by the execution engine.
+    Fallback: parse argus.log if cortex.json missing.
+    """
+    state = {
+        "conviction_score": 0,
+        "regime": "Searching...",
+        "risk_mult": 0.0,
+        "timestamp": None,
+        "raw_signal": None,
+        "severity": None,
+        "emergency_exit": None,
+        "parse_error": None,
+    }
+
+    cortex_path = project_root / "cortex.json"
+    if cortex_path.exists():
+        try:
+            with open(cortex_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # tolerate missing keys to stay forward/backward compatible
+            regime = str(data.get("regime", state["regime"]))
+            risk_mult = _safe_float(str(data.get("risk_mult", state["risk_mult"])), default=state["risk_mult"])
+
+            state["regime"] = regime
+            state["risk_mult"] = risk_mult
+            state["conviction_score"] = int(max(0.0, min(1.0, risk_mult)) * 100)
+
+            state["timestamp"] = data.get("timestamp")
+            state["raw_signal"] = data.get("raw_signal")
+            state["severity"] = data.get("severity")
+            # support both camel + snake
+            state["emergency_exit"] = data.get("EmergencyExit", data.get("emergency_exit"))
+            return state
+
+        except Exception as e:
+            state["parse_error"] = f"cortex.json read failed: {e}"
+
+    # --- Fallback: parse logs (best effort, robust to appended tokens) ---
     log_path = project_root / "argus.log"
-    state = {"conviction_score": 0, "regime": "Searching...", "risk_mult": 0.0}
     if log_path.exists():
         try:
-            with open(log_path, "r") as f:
+            with open(log_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-                for line in reversed(lines[-100:]):
-                    if "[REGIME]" in line and "Risk Multiplier:" in line:
-                        regime = line.split("[REGIME]")[1].split("|")[0].strip()
-                        risk_val = float(line.split("Risk Multiplier:")[1].strip())
-                        state["regime"], state["risk_mult"] = regime, risk_val
-                        state["conviction_score"] = int(risk_val * 100)
+
+            for line in reversed(lines[-250:]):
+                if "[REGIME]" in line and "Risk Multiplier:" in line:
+                    # regime is between [REGIME] and first '|'
+                    try:
+                        regime_part = line.split("[REGIME]", 1)[1]
+                        regime = regime_part.split("|", 1)[0].strip()
+
+                        # risk is between "Risk Multiplier:" and next '|'
+                        after = line.split("Risk Multiplier:", 1)[1].strip()
+                        risk_str = after.split("|", 1)[0].strip()
+                        risk_mult = _safe_float(risk_str, default=0.0)
+
+                        state["regime"] = regime
+                        state["risk_mult"] = risk_mult
+                        state["conviction_score"] = int(max(0.0, min(1.0, risk_mult)) * 100)
                         break
-        except: pass
+                    except Exception as e:
+                        state["parse_error"] = f"log parse failed: {e}"
+                        break
+
+        except Exception as e:
+            state["parse_error"] = f"log read failed: {e}"
+
     return state
 
-def get_auto_entry():
-    """Pulls from trade_state.json for the dashboard metrics."""
+
+def get_auto_entry() -> float:
     path = project_root / "trade_state.json"
     if path.exists():
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return float(json.load(f).get("entry_price", 90163.00))
-        except: pass
+        except Exception:
+            pass
     return 90163.00
 
-# --- MAIN DASHBOARD (V2.3 Structure) ---
+
+# --- MAIN DASHBOARD ---
 def main():
     st.title("🦅 ARGUS // LIVE COMMANDER")
     try:
@@ -123,7 +210,8 @@ def main():
         else:
             unrealized_pnl_usd, pnl_pct, breakeven = 0.0, 0.0, 0.0
     except Exception as e:
-        st.error(f"System Error: {e}"); return
+        st.error(f"System Error: {e}")
+        return
 
     # --- ROW 1: STATUS ---
     st.markdown("### 🏦 Liquid Status")
@@ -150,26 +238,61 @@ def main():
         st.subheader("Performance Curve")
         if not df.empty:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['Close'], mode='lines', line=dict(color='#00ff00', width=2)))
-            fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=350)
+            fig.add_trace(go.Scatter(x=df["Timestamp"], y=df["Close"], mode="lines", line=dict(color="#00ff00", width=2)))
+            fig.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=350,
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     with c2:
         st.subheader("Cortex State")
         cortex = get_cortex_state()
-        fig_gauge = go.Figure(go.Indicator(
-            mode = "gauge+number", value = cortex['conviction_score'],
-            gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': "darkblue"},
-                     'steps': [{'range': [0, 40], 'color': "red"}, {'range': [60, 100], 'color': "green"}]}
-        ))
-        fig_gauge.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, margin=dict(l=20,r=20,t=40,b=20))
+
+        fig_gauge = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=cortex["conviction_score"],
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": "darkblue"},
+                    "steps": [
+                        {"range": [0, 40], "color": "red"},
+                        {"range": [60, 100], "color": "green"},
+                    ],
+                },
+            )
+        )
+        fig_gauge.update_layout(
+            height=280,
+            paper_bgcolor="rgba(0,0,0,0)",
+            font={"color": "white"},
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig_gauge, use_container_width=True)
+
         st.markdown(f"<p style='text-align: center; color: gray;'>Regime: {cortex['regime']}</p>", unsafe_allow_html=True)
+
+        if cortex.get("timestamp"):
+            st.markdown(
+                f"<p style='text-align: center; color: #666;'>Updated: {cortex['timestamp']}</p>",
+                unsafe_allow_html=True,
+            )
+        if cortex.get("parse_error"):
+            st.markdown(
+                f"<p style='text-align: center; color: #aa4444;'>Cortex parse: {cortex['parse_error']}</p>",
+                unsafe_allow_html=True,
+            )
 
     # --- ROW 4: LOGS ---
     st.subheader("📜 System Logs")
     st.markdown(f"<div class='log-box'>{read_logs()}</div>", unsafe_allow_html=True)
 
-    time.sleep(10); st.rerun()
+    time.sleep(10)
+    st.rerun()
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()

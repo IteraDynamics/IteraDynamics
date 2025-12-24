@@ -232,7 +232,7 @@ def _load_trade_state():
 
 def generate_signals():
     cycle_start = _utc_ts()
-    print(f"[{cycle_start}] 🦅 ARGUS EXECUTION CYCLE...")
+    
 
     update_market_data()
 
