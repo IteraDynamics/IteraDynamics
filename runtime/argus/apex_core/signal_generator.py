@@ -1,5 +1,5 @@
 # runtime/argus/apex_core/signal_generator.py
-# 🦅 ARGUS LIVE PILOT - V3.4 (RUNTIME LAYOUT COMPAT)
+# 🦅 ARGUS LIVE PILOT - V3.5 (SMARTER DISCRETE DECISION LOGIC)
 
 from __future__ import annotations
 
@@ -70,6 +70,19 @@ PROFIT_HURDLE_PCT = float(os.getenv("ARGUS_PROFIT_HURDLE_PCT", "0.0035"))
 # Emergency exit threshold (severity in [0, 1]).
 EMERGENCY_SEVERITY_THRESHOLD = float(os.getenv("ARGUS_EMERGENCY_SEVERITY_THRESHOLD", "0.85"))
 
+# --- NEW: discrete decision tuning knobs ---
+# Hard stop-loss to cap downside on a single trade (e.g. 0.02 = -2%)
+STOP_LOSS_PCT = float(os.getenv("ARGUS_STOP_LOSS_PCT", "0.02"))
+
+# Hard max-hold to avoid zombie positions that never quite hit hurdle (in hours)
+MAX_HOLD_HOURS = float(os.getenv("ARGUS_MAX_HOLD_HOURS", "72.0"))
+
+# If severity exceeds this, we relax profit hurdle a bit to exit sooner
+HURDLE_RELIEF_SEVERITY = float(os.getenv("ARGUS_HURDLE_RELIEF_SEVERITY", "0.60"))
+
+# Factor to shrink hurdle when in bad regimes / high severity (e.g. 0.5 = cut in half)
+HURDLE_RELIEF_FACTOR = float(os.getenv("ARGUS_HURDLE_RELIEF_FACTOR", "0.5"))
+
 # ---------------------------
 # Broker import
 # ---------------------------
@@ -117,7 +130,9 @@ def update_market_data():
             if pd.isna(last_ts):
                 last_ts = pd.Timestamp.min.tz_localize("UTC")
         else:
-            pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]).to_csv(DATA_FILE, index=False)
+            pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]).to_csv(
+                DATA_FILE, index=False
+            )
             last_ts = pd.Timestamp.min.tz_localize("UTC")
 
         new_rows = []
@@ -232,7 +247,6 @@ def _load_trade_state():
 
 def generate_signals():
     cycle_start = _utc_ts()
-    
 
     update_market_data()
 
@@ -359,7 +373,9 @@ def generate_signals():
             return
 
         btc_qty = target_usd / price
-        print(f"   >> [EXECUTION] ROUTE BUY | TargetUSD: ${target_usd:.2f} | QtyBTC: {btc_qty:.8f} | Price: ${price:.2f}")
+        print(
+            f"   >> [EXECUTION] ROUTE BUY | TargetUSD: ${target_usd:.2f} | QtyBTC: {btc_qty:.8f} | Price: ${price:.2f}"
+        )
 
         _broker.execute_trade("BUY", btc_qty, price)
         return
@@ -396,21 +412,56 @@ def generate_signals():
         entry_time = state["_entry_time"]
         entry_price = float(state["entry_price"])
 
-        hold_time = datetime.now(timezone.utc) - entry_time
-        if hold_time < timedelta(hours=MIN_HOLD_HOURS):
-            print(
-                f"   >> [DECISION] HOLD | Reason: MIN_HOLD_NOT_MET | Held: {hold_time.total_seconds()/3600:.2f}h | Min: {MIN_HOLD_HOURS:.2f}h"
-            )
-            return
-
+        now_utc = datetime.now(timezone.utc)
+        hold_time = now_utc - entry_time
+        hold_hours = hold_time.total_seconds() / 3600.0
         profit_pct = (price - entry_price) / entry_price
-        if profit_pct < PROFIT_HURDLE_PCT:
+
+        # --- 1) Hard stop-loss: dominates all other guardrails ---
+        if profit_pct <= -STOP_LOSS_PCT:
             print(
-                f"   >> [DECISION] HOLD | Reason: PROFIT_HURDLE_NOT_MET | Profit: {profit_pct:.3%} | Hurdle: {PROFIT_HURDLE_PCT:.3%}"
+                f"   >> [EXECUTION] ROUTE SELL | Reason: STOP_LOSS_TRIGGERED | Loss: {profit_pct:.3%} | "
+                f"Entry: ${entry_price:.2f} | Now: ${price:.2f}"
+            )
+            _broker.execute_trade("SELL", btc, price)
+            return
+
+        # --- 2) Max-hold failsafe to avoid zombie positions ---
+        if hold_hours >= MAX_HOLD_HOURS:
+            print(
+                f"   >> [EXECUTION] ROUTE SELL | Reason: MAX_HOLD_EXCEEDED | Held: {hold_hours:.2f}h | "
+                f"Entry: ${entry_price:.2f} | Now: ${price:.2f} | PnL: {profit_pct:.3%}"
+            )
+            _broker.execute_trade("SELL", btc, price)
+            return
+
+        # --- 3) Min-hold: only block sells before MIN_HOLD_HOURS unless stop-loss already triggered ---
+        if hold_hours < MIN_HOLD_HOURS:
+            print(
+                f"   >> [DECISION] HOLD | Reason: MIN_HOLD_NOT_MET | Held: {hold_hours:.2f}h | "
+                f"Min: {MIN_HOLD_HOURS:.2f}h"
             )
             return
 
-        print(f"   >> [EXECUTION] ROUTE SELL | Profit: {profit_pct:.3%} | Entry: ${entry_price:.2f} | Now: ${price:.2f}")
+        # --- 4) Dynamic profit hurdle after min-hold ---
+        effective_hurdle = PROFIT_HURDLE_PCT
+
+        bad_regime = ("BEAR" in regime) or ("RECOVERY" in regime)
+        if severity >= HURDLE_RELIEF_SEVERITY or bad_regime:
+            effective_hurdle = PROFIT_HURDLE_PCT * HURDLE_RELIEF_FACTOR
+
+        if profit_pct < effective_hurdle:
+            print(
+                f"   >> [DECISION] HOLD | Reason: PROFIT_HURDLE_NOT_MET | Profit: {profit_pct:.3%} | "
+                f"HurdleEff: {effective_hurdle:.3%} | BaseHurdle: {PROFIT_HURDLE_PCT:.3%}"
+            )
+            return
+
+        print(
+            f"   >> [EXECUTION] ROUTE SELL | Profit: {profit_pct:.3%} | "
+            f"Held: {hold_hours:.2f}h | HurdleEff: {effective_hurdle:.3%} | "
+            f"Entry: ${entry_price:.2f} | Now: ${price:.2f}"
+        )
         _broker.execute_trade("SELL", btc, price)
         return
 
