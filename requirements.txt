@@ -1,0 +1,27 @@
+# === Core Runtime ===
+python-dotenv
+requests
+schedule
+joblib
+pandas
+numpy
+
+# === Technical Indicators ===
+pandas-ta
+
+# === Model & ML ===
+scikit-learn
+
+# === Dashboard / UI ===
+streamlit
+plotly
+
+# === Exchange Connectivity ===
+coinbase-advanced-py
+
+# === Utilities ===
+typing_extensions
+jinja2
+
+# Optional (good for research + debugging)
+matplotlib
