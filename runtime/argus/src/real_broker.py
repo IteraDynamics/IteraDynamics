@@ -1,5 +1,6 @@
 # src/real_broker.py
-# 🦅 ARGUS REAL BROKER - V8.2 (ATOMIC STATE + IDEMPOTENCY + TZ-AWARE UTC)
+# 🦅 ARGUS REAL BROKER - V9.0
+# (ATOMIC STATE + IDEMPOTENCY + TZ-AWARE UTC + DRY-RUN SUPPORT)
 
 import os
 import json
@@ -22,7 +23,27 @@ STATE_TMP = PROJECT_ROOT / "trade_state.json.tmp"
 PRODUCT_ID = "BTC-USD"
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class RealBroker:
+    """
+    Live Coinbase broker wrapper.
+
+    Key behaviors:
+    - Uses HARDCODED_UUID portfolio.
+    - Persists trade_state.json on LIVE BUY / SELL for Argus guardrails.
+    - Respects ARGUS_DRY_RUN env:
+        * When True:
+            - No live orders are sent.
+            - trade_state.json is NOT mutated.
+            - Wallet snapshot still uses real Coinbase balances.
+    """
+
     def __init__(self):
         self.api_key = os.getenv("COINBASE_API_KEY") or os.getenv("CB_API_KEY")
         self.api_secret = os.getenv("COINBASE_API_SECRET") or os.getenv("CB_API_SECRET")
@@ -30,11 +51,20 @@ class RealBroker:
         if not self.api_key or not self.api_secret:
             raise ValueError("❌ MISSING API KEYS in .env")
 
+        # Allow "\n" literals for multiline secrets
         self.api_secret = self.api_secret.replace("\\n", "\n")
+
+        # DRY-RUN toggle (default: LIVE)
+        self.dry_run = _env_bool("ARGUS_DRY_RUN", default=False)
+
+        # Cache for dashboard properties
+        self._last_cash: float = 0.0
+        self._last_btc: float = 0.0
 
         try:
             self.client = RESTClient(api_key=self.api_key, api_secret=self.api_secret)
-            print(f"🔌 RealBroker: Connected. TARGETING UUID: {HARDCODED_UUID}")
+            mode_str = "DRY-RUN (no live orders)" if self.dry_run else "LIVE"
+            print(f"🔌 RealBroker: Connected. TARGETING UUID: {HARDCODED_UUID} | MODE: {mode_str}")
         except Exception as e:
             print(f"❌ CONNECTION ERROR: {e}")
             raise
@@ -55,6 +85,8 @@ class RealBroker:
         """
         Saves entry data so the Signal Generator can perform SELL guardrails later.
         Stored as tz-aware UTC ISO8601 (+00:00).
+
+        Only used in LIVE mode; DRY-RUN paths do not mutate state.
         """
         state = {
             "entry_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -66,6 +98,8 @@ class RealBroker:
     def clear_trade_state(self) -> None:
         """
         Clears memory after a successful exit.
+
+        Only used in LIVE mode; DRY-RUN paths do not mutate state.
         """
         try:
             if STATE_FILE.exists():
@@ -104,7 +138,26 @@ class RealBroker:
                 cash = self._get_value(getattr(acc, "available_balance", None))
             elif ccy == "BTC":
                 btc = self._get_value(getattr(acc, "available_balance", None))
+
+        # Cache for dashboard / properties
+        self._last_cash = cash
+        self._last_btc = btc
+
         return cash, btc
+
+    @property
+    def cash(self) -> float:
+        """
+        Last observed USD cash from get_wallet_snapshot().
+        """
+        return self._last_cash
+
+    @property
+    def positions(self) -> float:
+        """
+        Last observed BTC units from get_wallet_snapshot().
+        """
+        return self._last_btc
 
     # ---------------------------
     # Execution
@@ -115,6 +168,11 @@ class RealBroker:
         action: BUY or SELL
         qty: BTC units
         price: last close used to compute quote_size for BUY
+
+        DRY-RUN behavior:
+        - Logs what would be done.
+        - Does NOT send live orders.
+        - Does NOT touch trade_state.json.
         """
         action_u = action.upper().strip()
 
@@ -123,12 +181,52 @@ class RealBroker:
 
         client_order_id = uuid.uuid4().hex
 
+        # ---------------------------
+        # DRY-RUN PATH
+        # ---------------------------
+        if self.dry_run:
+            try:
+                if action_u == "BUY":
+                    if price is None or price <= 0:
+                        raise ValueError("BUY requires a valid price to compute quote_size")
+
+                    usd_size = (Decimal(str(qty)) * Decimal(str(price))).quantize(
+                        Decimal("0.01"), rounding=ROUND_DOWN
+                    )
+                    print(
+                        f"   [DRY-RUN] Would BUY approx ${usd_size} "
+                        f"({qty:.8f} BTC) at ~${float(price):.2f} "
+                        f"(client_order_id={client_order_id})"
+                    )
+
+                elif action_u == "SELL":
+                    btc_size = Decimal(str(qty)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+                    print(
+                        f"   [DRY-RUN] Would SELL {btc_size} BTC "
+                        f"at ~${float(price) if price else 0.0:.2f} "
+                        f"(client_order_id={client_order_id})"
+                    )
+
+                else:
+                    raise ValueError(f"UNKNOWN action={action}")
+
+                print("   [DRY-RUN] No live order sent; trade_state.json unchanged.")
+                return True
+            except Exception as e:
+                print(f"   [DRY-RUN] ORDER SIMULATION ERROR: {e}")
+                return False
+
+        # ---------------------------
+        # LIVE PATH
+        # ---------------------------
         try:
             if action_u == "BUY":
                 if price is None or price <= 0:
                     raise ValueError("BUY requires a valid price to compute quote_size")
 
-                usd_size = (Decimal(str(qty)) * Decimal(str(price))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                usd_size = (Decimal(str(qty)) * Decimal(str(price))).quantize(
+                    Decimal("0.01"), rounding=ROUND_DOWN
+                )
                 if usd_size <= 0:
                     raise ValueError(f"Computed usd_size invalid: {usd_size}")
 
