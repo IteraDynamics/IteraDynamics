@@ -367,6 +367,14 @@ def generate_signals():
             print(f"   >> [DECISION] HOLD | Reason: RISK_MULT_ZERO | Regime: {regime}")
             return
 
+        # 🛡️ Option A: disable pyramiding while already in a position
+        if btc_notional >= MIN_NOTIONAL_USD:
+            print(
+                f"   >> [DECISION] HOLD | Reason: ALREADY_IN_POSITION_NO_PYRAMID | "
+                f"BTC_Notional: ${btc_notional:.2f}"
+            )
+            return
+
         target_usd = cash * risk_mult
         if target_usd < MIN_NOTIONAL_USD:
             print(f"   >> [DECISION] HOLD | Reason: TARGET_BELOW_MIN_NOTIONAL | Target: ${target_usd:.2f}")
