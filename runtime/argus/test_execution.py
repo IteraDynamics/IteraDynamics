@@ -35,9 +35,24 @@ from typing import Optional, Tuple
 # ---------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR  # runtime/argus/
+_REPO_ROOT = _PROJECT_ROOT.parent.parent  # IteraDynamics_Mono/
 
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Load .env from multiple possible locations
+from dotenv import load_dotenv
+
+# Try repo root first (local dev), then runtime/argus/, then /etc/argus/
+for env_path in [
+    _REPO_ROOT / ".env",
+    _PROJECT_ROOT / ".env",
+    Path("/etc/argus/argus.env"),
+]:
+    if env_path.exists():
+        load_dotenv(str(env_path), override=False)
+        print(f"📄 Loaded env from: {env_path}")
+        break
 
 # Force dry-run mode for ALL tests
 os.environ["ARGUS_DRY_RUN"] = "1"
