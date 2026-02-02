@@ -9,7 +9,7 @@ attention ranking system for prioritizing origins/sources.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_nowcast_attention
+    from . import compute_nowcast_attention
 
     events = [
         {"timestamp": "2025-01-01T10:00:00Z", "origin": "twitter", "type": "flag"},
@@ -36,11 +36,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, DefaultDict
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
-from signal_engine.analytics.volatility_regimes import compute_volatility_regimes
-from signal_engine.analytics.threshold_policy import threshold_for_regime
-from signal_engine.analytics.source_metrics import compute_source_metrics
-from signal_engine.analytics.lead_lag import compute_lead_lag
+from .origin_utils import normalize_origin, parse_timestamp
+from .volatility_regimes import compute_volatility_regimes
+from .threshold_policy import threshold_for_regime
+from .source_metrics import compute_source_metrics
+from .lead_lag import compute_lead_lag
 
 
 def _bucket_start(dt: datetime, interval: str) -> datetime:

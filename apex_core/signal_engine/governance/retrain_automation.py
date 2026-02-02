@@ -12,7 +12,7 @@ Key concepts:
 
 Example:
     ```python
-    from signal_engine.governance import (
+    from . import (
         RetrainConfig,
         DriftCandidate,
         CalibrationPoint,
@@ -236,7 +236,7 @@ def check_calibration_still_high(
         True if most recent point has ECE > threshold
 
     Example:
-        >>> from signal_engine.governance.drift_response import CalibrationPoint
+        >>> from .drift_response import CalibrationPoint
         >>> points = [
         ...     CalibrationPoint("2025-10-30T10:00:00Z", ece=0.05, n=50),
         ...     CalibrationPoint("2025-10-30T12:00:00Z", ece=0.09, n=60)
@@ -269,7 +269,7 @@ def should_retrain_candidate(
         True if retraining should be planned
 
     Example:
-        >>> from signal_engine.governance.drift_response import DriftCandidate
+        >>> from .drift_response import DriftCandidate
         >>> candidate = DriftCandidate(
         ...     origin="news",
         ...     model_version="v1",
@@ -314,7 +314,7 @@ def plan_retraining(
         RetrainPlan with candidates and decisions
 
     Example:
-        >>> from signal_engine.governance.drift_response import DriftCandidate, CalibrationPoint
+        >>> from .drift_response import DriftCandidate, CalibrationPoint
         >>> drift_cands = [
         ...     DriftCandidate(
         ...         origin="news",
@@ -412,7 +412,7 @@ def plan_retraining_from_json(
         )
 
     # Import here to avoid circular dependency
-    from signal_engine.governance.drift_response import (
+    from .drift_response import (
         DriftCandidate,
         CalibrationPoint
     )

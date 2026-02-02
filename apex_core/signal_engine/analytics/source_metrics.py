@@ -6,7 +6,7 @@ Useful for evaluating which sources generate high-quality signals.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_source_metrics
+    from . import compute_source_metrics
 
     events = [
         {"timestamp": "2025-01-01T10:00:00Z", "origin": "twitter", "type": "flag"},
@@ -32,7 +32,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
+from .origin_utils import normalize_origin, parse_timestamp
 
 
 def compute_source_metrics(

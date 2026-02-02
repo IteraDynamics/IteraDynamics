@@ -6,7 +6,7 @@ Useful for identifying sudden spikes in event activity per origin/source.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_bursts
+    from . import compute_bursts
     from datetime import datetime, timezone
 
     events = [
@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from math import sqrt
 from typing import Dict, Any, List, DefaultDict
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
+from .origin_utils import normalize_origin, parse_timestamp
 
 
 def _bucket_start(dt: datetime, interval: str) -> datetime:

@@ -6,7 +6,7 @@ Identifies which origins tend to spike before others.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_lead_lag
+    from . import compute_lead_lag
 
     events = [
         {"timestamp": "2025-01-01T10:00:00Z", "origin": "twitter"},
@@ -36,7 +36,7 @@ from itertools import permutations
 from math import sqrt
 from typing import Dict, Any, List, Tuple, DefaultDict
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
+from .origin_utils import normalize_origin, parse_timestamp
 
 
 def _bucket_start(dt: datetime, interval: str) -> datetime:

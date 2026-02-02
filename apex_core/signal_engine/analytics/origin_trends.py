@@ -6,7 +6,7 @@ Useful for visualizing activity patterns and identifying temporal trends.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_origin_trends
+    from . import compute_origin_trends
 
     events = [
         {"timestamp": "2025-01-01T10:00:00Z", "origin": "twitter", "type": "flag"},
@@ -32,7 +32,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Tuple, DefaultDict
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
+from .origin_utils import normalize_origin, parse_timestamp
 
 
 def _bucket_start(dt: datetime, interval: str) -> datetime:

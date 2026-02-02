@@ -336,6 +336,7 @@ def _run_prime() -> None:
     # Load model + data
     try:
         model_path = MODELS_DIR / MODEL_FILE
+        print ("   >>[PROVENANCE] MODEL_PATH:", str(model_path))
         model = joblib.load(model_path)
         df = pd.read_csv(DATA_FILE)
     except Exception as e:

@@ -1,4 +1,4 @@
-# src/ml/infer.py
+# apex_core/infer.py
 from __future__ import annotations
 import json
 import os
@@ -9,13 +9,13 @@ import joblib
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-from src.paths import (
+from apex_core.paths import (
     MODELS_DIR,
     RETRAINING_LOG_PATH,
     RETRAINING_TRIGGERED_LOG_PATH
 )
-from src.jsonl_writer import atomic_jsonl_append
-from src.analytics.origin_utils import normalize_origin as _norm
+from apex_core.jsonl_writer import atomic_jsonl_append
+from apex_core.signal_engine.analytics.origin_utils import normalize_origin as _norm
 
 logger = logging.getLogger(__name__)
 

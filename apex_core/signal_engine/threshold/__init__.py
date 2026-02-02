@@ -10,7 +10,7 @@ Provides comprehensive threshold optimization and analysis including:
 Example:
     ```python
     # Classification threshold optimization
-    from signal_engine.threshold import optimize_classification_threshold
+    from . import optimize_classification_threshold
 
     scores = [0.9, 0.8, 0.7, 0.6, 0.5]
     labels = [True, True, True, False, False]
@@ -23,7 +23,7 @@ Example:
     print(f"Optimal threshold: {result.threshold:.3f}")
 
     # Feedback-based simulation
-    from signal_engine.threshold import simulate_thresholds
+    from . import simulate_thresholds
 
     feedback = [{"confidence": 0.8, "agrees_with_signal": True}, ...]
     results = simulate_thresholds(feedback, min_confidence=0.7)
@@ -31,14 +31,14 @@ Example:
 """
 
 # Feedback-based simulation (from simulator.py)
-from signal_engine.threshold.simulator import (
+from .simulator import (
     simulate_thresholds,
     analyze_threshold_range,
     find_optimal_threshold,  # For feedback disagreement rate
 )
 
 # Classification threshold optimization (from optimization.py)
-from signal_engine.threshold.optimization import (
+from .optimization import (
     ThresholdMetrics,
     ThresholdRecommendation,
     compute_confusion_matrix,

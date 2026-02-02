@@ -12,7 +12,7 @@ Key concepts:
 
 Example:
     ```python
-    from signal_engine.validation import (
+    from . import (
         compute_confidence_interval,
         is_statistically_significant,
         compare_models_performance

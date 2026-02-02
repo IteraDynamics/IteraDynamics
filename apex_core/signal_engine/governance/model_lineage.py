@@ -13,7 +13,7 @@ Key concepts:
 
 Example:
     ```python
-    from signal_engine.governance import (
+    from . import (
         VersionNode,
         ModelLineage,
         build_lineage_graph

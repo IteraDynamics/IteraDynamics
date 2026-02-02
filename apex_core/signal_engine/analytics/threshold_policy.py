@@ -6,7 +6,7 @@ Used for adjusting signal filtering based on market conditions.
 
 Example:
     ```python
-    from signal_engine.analytics import threshold_for_regime
+    from . import threshold_for_regime
 
     regime = "turbulent"
     threshold = threshold_for_regime(regime)

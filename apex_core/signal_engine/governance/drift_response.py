@@ -13,7 +13,7 @@ Key concepts:
 
 Example:
     ```python
-    from signal_engine.governance import (
+    from . import (
         DriftConfig,
         CalibrationPoint,
         detect_drift_candidates

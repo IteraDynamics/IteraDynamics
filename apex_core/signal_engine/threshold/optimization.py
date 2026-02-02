@@ -12,7 +12,7 @@ Key concepts:
 
 Example:
     ```python
-    from signal_engine.threshold import (
+    from . import (
         sweep_thresholds,
         optimize_classification_threshold,
         ThresholdRecommendation

@@ -9,7 +9,7 @@ Provides comprehensive validation tools for model performance including:
 Example:
     ```python
     # Calibration analysis
-    from signal_engine.validation import compute_calibration_metrics
+    from . import compute_calibration_metrics
 
     y_true = [1, 0, 1, 1, 0]
     y_prob = [0.9, 0.2, 0.8, 0.7, 0.3]
@@ -17,7 +17,7 @@ Example:
     print(f"ECE: {metrics.ece:.4f}, Brier: {metrics.brier:.4f}")
 
     # Performance validation
-    from signal_engine.validation import (
+    from . import (
         compute_sharpe_ratio,
         compare_models_performance
     )
@@ -30,7 +30,7 @@ Example:
     print(f"Significant improvement: {comparison.is_significant}")
 
     # Reliability scoring
-    from signal_engine.validation import compute_temporal_reliability
+    from . import compute_temporal_reliability
 
     feedback = [...]  # List of feedback entries
     scored = compute_temporal_reliability(feedback)
@@ -38,7 +38,7 @@ Example:
 """
 
 # Reliability assessment
-from signal_engine.validation.reliability import (
+from .reliability import (
     compute_basic_reliability,
     compute_temporal_reliability,
     aggregate_feedback_reliability,
@@ -46,7 +46,7 @@ from signal_engine.validation.reliability import (
 )
 
 # Calibration analysis
-from signal_engine.validation.calibration import (
+from .calibration import (
     CalibrationBin,
     CalibrationMetrics,
     compute_brier_score,
@@ -59,7 +59,7 @@ from signal_engine.validation.calibration import (
 )
 
 # Performance validation
-from signal_engine.validation.performance import (
+from .performance import (
     ConfidenceInterval,
     StatisticalTest,
     PerformanceComparison,

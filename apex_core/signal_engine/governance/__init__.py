@@ -11,7 +11,7 @@ This module provides tools for automated model governance, including:
 Example:
     ```python
     # Blue-green deployment
-    from signal_engine.governance import (
+    from . import (
         BlueGreenConfig,
         ModelMetrics,
         compare_models
@@ -27,7 +27,7 @@ Example:
     print(f"Decision: {result.classification}")
 
     # Drift detection
-    from signal_engine.governance import (
+    from . import (
         DriftConfig,
         CalibrationPoint,
         detect_drift_candidates
@@ -45,7 +45,7 @@ Example:
     )
 
     # Auto-adjustment
-    from signal_engine.governance import (
+    from . import (
         AdjustmentRules,
         PerformanceMetrics,
         adjust_governance_params
@@ -57,7 +57,7 @@ Example:
     )
 
     # Model lineage
-    from signal_engine.governance import (
+    from . import (
         VersionNode,
         build_lineage_graph
     )
@@ -71,7 +71,7 @@ Example:
 """
 
 # Blue-green deployment
-from signal_engine.governance.bluegreen_promotion import (
+from .bluegreen_promotion import (
     BlueGreenConfig,
     ModelMetrics,
     ComparisonResult,
@@ -83,7 +83,7 @@ from signal_engine.governance.bluegreen_promotion import (
 )
 
 # Drift detection and response
-from signal_engine.governance.drift_response import (
+from .drift_response import (
     DriftConfig,
     CalibrationPoint,
     DriftCandidate,
@@ -95,7 +95,7 @@ from signal_engine.governance.drift_response import (
 )
 
 # Automated parameter adjustment
-from signal_engine.governance.auto_adjust import (
+from .auto_adjust import (
     AdjustmentRules,
     PerformanceMetrics,
     GovernanceParams,
@@ -108,7 +108,7 @@ from signal_engine.governance.auto_adjust import (
 )
 
 # Retrain automation
-from signal_engine.governance.retrain_automation import (
+from .retrain_automation import (
     RetrainConfig,
     RetrainCandidate,
     RetrainPlan,
@@ -119,7 +119,7 @@ from signal_engine.governance.retrain_automation import (
 )
 
 # Model lineage tracking
-from signal_engine.governance.model_lineage import (
+from .model_lineage import (
     VersionNode,
     LineageEdge,
     ModelLineage,

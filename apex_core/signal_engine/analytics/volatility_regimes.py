@@ -6,7 +6,7 @@ rolling standard deviation. Useful for adaptive threshold policies.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_volatility_regimes
+    from . import compute_volatility_regimes
 
     events = [
         {"timestamp": "2025-01-01T10:00:00Z", "origin": "twitter"},
@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from math import sqrt
 from typing import Dict, Any, List, DefaultDict
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
+from .origin_utils import normalize_origin, parse_timestamp
 
 
 def _bucket_start(dt: datetime, interval: str) -> datetime:

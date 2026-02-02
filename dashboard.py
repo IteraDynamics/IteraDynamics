@@ -229,8 +229,9 @@ def get_live_price() -> float:
 
 
 @st.cache_data(ttl=10)
-def load_market_data() -> pd.DataFrame:
-    csv_path = project_root / "flight_recorder.csv"
+def _load_market_data_cached(_mtime: float, path_str: str) -> pd.DataFrame:
+    # cache key includes file mtime so the chart updates immediately when CSV changes
+    csv_path = Path(path_str)
     if not csv_path.exists():
         return pd.DataFrame()
     try:
@@ -247,6 +248,15 @@ def load_market_data() -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
+
+
+def load_market_data() -> pd.DataFrame:
+    csv_path = project_root / "flight_recorder.csv"
+    try:
+        mtime = os.path.getmtime(str(csv_path)) if csv_path.exists() else 0.0
+    except Exception:
+        mtime = 0.0
+    return _load_market_data_cached(mtime, str(csv_path))
 
 
 def _safe_read_tail(path: Path, n_lines: int = 300) -> str:
@@ -266,15 +276,26 @@ def read_logs() -> str:
     return txt if txt else "Waiting for logs..."
 
 
-def _safe_load_json(path: Path) -> dict | None:
+@st.cache_data(ttl=5)
+def _load_json_cached(_mtime: float, path_str: str) -> dict | None:
+    # cache key includes file mtime so cortex updates immediately when writer replaces file
+    p = Path(path_str)
     try:
-        if not path.exists():
+        if not p.exists():
             return None
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             obj = json.load(f)
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
+
+def _safe_load_json(path: Path) -> dict | None:
+    try:
+        mtime = os.path.getmtime(str(path)) if path.exists() else 0.0
+    except Exception:
+        mtime = 0.0
+    return _load_json_cached(mtime, str(path))
 
 
 def _parse_iso(ts: str | None) -> datetime | None:
@@ -653,7 +674,7 @@ def main():
                 margin=dict(l=10, r=10, t=10, b=10),
                 showlegend=False,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.markdown("<div class='subtle'>No market data found (flight_recorder.csv missing).</div>", unsafe_allow_html=True)
 
@@ -683,7 +704,7 @@ def main():
                 font={"color": "white"},
                 margin=dict(l=20, r=20, t=40, b=20),
             )
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width="stretch")
 
             p_long = cortex.get("p_long")
             conf_min = cortex.get("conf_min")
@@ -741,7 +762,7 @@ def main():
                 font={"color": "white"},
                 margin=dict(l=20, r=20, t=40, b=20),
             )
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width="stretch")
 
             regime_html = f"<p style='text-align:center; color:#d7deee;'>Regime: <b style='color:white'>{cortex.get('regime','—')}</b></p>"
             signal_html = f"<p style='text-align:center; color:#d7deee;'>Raw Signal: <b style='color:white'>{cortex.get('raw_signal','—')}</b></p>"

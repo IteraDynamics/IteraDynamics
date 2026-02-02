@@ -12,7 +12,7 @@ Provides comprehensive analytics for signal generation systems including:
 
 Example:
     ```python
-    from signal_engine.analytics import (
+    from . import (
         compute_bursts,
         compute_origin_correlations,
         compute_lead_lag,
@@ -38,7 +38,7 @@ Example:
 """
 
 # Origin utilities
-from signal_engine.analytics.origin_utils import (
+from .origin_utils import (
     DEFAULT_ALIAS_MAP,
     normalize_origin,
     extract_origin,
@@ -51,47 +51,47 @@ from signal_engine.analytics.origin_utils import (
 )
 
 # Threshold policy
-from signal_engine.analytics.threshold_policy import (
+from .threshold_policy import (
     threshold_for_regime,
 )
 
 # Burst detection
-from signal_engine.analytics.burst_detection import (
+from .burst_detection import (
     compute_bursts,
 )
 
 # Correlation analysis
-from signal_engine.analytics.origin_correlations import (
+from .origin_correlations import (
     compute_origin_correlations,
 )
 
 # Trend analysis
-from signal_engine.analytics.origin_trends import (
+from .origin_trends import (
     compute_origin_trends,
 )
 
 # Volatility regimes
-from signal_engine.analytics.volatility_regimes import (
+from .volatility_regimes import (
     compute_volatility_regimes,
 )
 
 # Lead-lag analysis
-from signal_engine.analytics.lead_lag import (
+from .lead_lag import (
     compute_lead_lag,
 )
 
 # Source metrics
-from signal_engine.analytics.source_metrics import (
+from .source_metrics import (
     compute_source_metrics,
 )
 
 # Source yield
-from signal_engine.analytics.source_yield import (
+from .source_yield import (
     compute_source_yield,
 )
 
 # Nowcast attention
-from signal_engine.analytics.nowcast_attention import (
+from .nowcast_attention import (
     compute_nowcast_attention,
 )
 

@@ -17,18 +17,19 @@ Modules:
 __version__ = "1.0.0"
 __author__ = "Signal Engine Team"
 
-from signal_engine.interfaces import (
+# Use relative imports within the package
+from .interfaces import (
     PriceProvider,
     SentimentProvider,
     MarketDataProvider,
 )
 
 # Import submodules for easier access
-from signal_engine import ml
-from signal_engine import validation
-from signal_engine import threshold
-from signal_engine import analytics
-from signal_engine import interfaces
+from . import ml
+from . import validation
+from . import threshold
+from . import analytics
+from . import interfaces
 
 __all__ = [
     # Version info

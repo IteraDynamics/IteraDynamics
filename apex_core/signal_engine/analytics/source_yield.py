@@ -6,7 +6,7 @@ Useful for resource allocation and budget planning across sources.
 
 Example:
     ```python
-    from signal_engine.analytics import compute_source_yield
+    from . import compute_source_yield
 
     events = [
         {"timestamp": "2025-01-01T10:00:00Z", "origin": "twitter", "type": "flag"},
@@ -36,7 +36,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 
-from signal_engine.analytics.origin_utils import normalize_origin, parse_timestamp
+from .origin_utils import normalize_origin, parse_timestamp
 
 
 def compute_source_yield(
