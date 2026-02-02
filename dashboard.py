@@ -81,28 +81,40 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # IMPORT REALBROKER
 # ---------------------------
 
+RealBroker = None
+broker_import_err = None
+
 try:
     from src.real_broker import RealBroker
 except ImportError as e:
     broker_import_err = str(e)
-    try:
-        import importlib
 
-        RealBroker = importlib.import_module(
-            "iteradynamics_monorepo.src.real_broker"
-        ).RealBroker  # type: ignore[attr-defined]
-    except Exception:
-        st.error(
-            "❌ Could not import RealBroker.\n\n"
-            "Checked:\n"
-            f"  • {project_root / 'src' / 'real_broker.py'}\n"
-            f"  • mono-repo package 'iteradynamics_monorepo.src.real_broker'\n\n"
-            "Make sure that:\n"
-            "  1) On the server: `dashboard.py` and `src/real_broker.py` live under the same root (e.g., /opt/argus).\n"
-            "  2) On your local mono-repo: `runtime/argus/src/real_broker.py` exists.\n\n"
-            f"Debug detail: {broker_import_err}"
-        )
-        st.stop()
+if RealBroker is None:
+    # Fallback: try direct file import from detected project_root
+    try:
+        import importlib.util
+        broker_path = project_root / "src" / "real_broker.py"
+        if broker_path.exists():
+            spec = importlib.util.spec_from_file_location("real_broker", broker_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                RealBroker = module.RealBroker
+    except Exception as e2:
+        broker_import_err = f"{broker_import_err}; fallback also failed: {e2}"
+
+if RealBroker is None:
+    st.error(
+        "❌ Could not import RealBroker.\n\n"
+        "Checked:\n"
+        f"  • sys.path import 'src.real_broker'\n"
+        f"  • Direct file: {project_root / 'src' / 'real_broker.py'}\n\n"
+        "Make sure that:\n"
+        "  1) On the server: `dashboard.py` and `src/real_broker.py` live under the same root (e.g., /opt/argus).\n"
+        "  2) On your local mono-repo: `runtime/argus/src/real_broker.py` exists.\n\n"
+        f"Debug detail: {broker_import_err}"
+    )
+    st.stop()
 
 # ---------------------------
 # STREAMLIT CONFIG / STYLES
