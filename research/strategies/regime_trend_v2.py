@@ -147,7 +147,12 @@ def build_signals_regime_trend_v2(
 
         # -------- Entry --------
         entry_signal = False
-        if reg:
+
+        regime_ok = False
+        if "regime_label" in df.columns:
+            regime_ok = (df["regime_label"].iloc[i] == "TREND_UP")
+
+        if reg and regime_ok:
             if params.use_golden_cross and bool(golden_cross.iloc[i]):
                 entry_signal = True
             if params.use_breakout and bool(breakout.iloc[i]):

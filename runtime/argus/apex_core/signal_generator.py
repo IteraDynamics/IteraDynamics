@@ -1,44 +1,53 @@
-# /opt/argus/apex_core/signal_generator.py
-# 🦅 ARGUS SIGNAL ENGINE (LEGACY + ARGUS PRIME) — FULL FILE REPLACEMENT
+# runtime/argus/apex_core/signal_generator.py
+# 🦅 ARGUS SIGNAL GENERATOR — REFACTORED (Strategy Intent + SG Gates/Execution)
 #
-# ARGUS_MODE:
-#   - "prime"  -> Argus Prime live pilot (conf-gated proba + horizon hold + DD governors + sizing)
-#   - else     -> Legacy engine (your existing v3.6 behavior)
+# Design:
+#   - Strategy produces an "intent" (ENTER_LONG / EXIT_LONG / FLAT / HOLD)
+#   - SG applies safety gates (wallet verification, min notional, drawdown governors, horizon, etc.)
+#   - SG executes through RealBroker and writes state + cortex.json
 #
-# Prime risk controls:
-#   1) PRIME_DD_SOFT: reduce exposure (default multiplier 0.5)
-#   2) PRIME_DD_HARD: block new entries, allow exits
-#   3) PRIME_DD_KILL: liquidate and set killed flag (requires manual reset)
+# Modes:
+#   ARGUS_MODE="prime"   -> PrimeModelStrategy (predict_proba + horizon + DD governors)
+#   else                -> LegacyModelStrategy (predict + legacy regime risk_mult + sell guardrails)
 #
-# Prime position sizing:
-#   size_usd = equity_usd * min(PRIME_MAX_EXPOSURE, dd_adjusted_exposure)
+# OPTIONAL external strategy override:
+#   ARGUS_STRATEGY_MODULE="research.strategies.sg_stub_strategy"
+#   ARGUS_STRATEGY_FUNC="generate_intent"
 #
-# Prime: single position, no overlap, hold exactly PRIME_HORIZON hours.
+# Prime extra generic gates added:
+#   - PRIME_REENTRY_COOLDOWN_H: blocks new entries for N hours after an exit (generic churn killer)
+#   - PRIME_EXIT_MIN_HOLD_H   : blocks non-panic exits for first N hours after entry
+#     (panic exits are allowed if strategy marks meta.exit_kind=="panic" or reason contains "vol_panic")
 #
 # IMPORTANT:
-# - In DRY-RUN, Prime writes paper state to paper_prime_state.json (never prime_state.json)
-# - In LIVE, Prime writes to prime_state.json
+# - DRY-RUN:
+#     - Prime uses paper_prime_state.json (never touches prime_state.json)
+#     - Legacy still reads trade_state.json (if present) but will not execute real trades if broker is dry-run
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 import json
 import joblib
 import requests
+import importlib
 import pandas as pd
 import pandas_ta as ta
 
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from typing import Any, Callable
 from dotenv import load_dotenv
 
+
 # ---------------------------
-# Path / env resolution (/opt/argus as project root)
+# Path / env resolution
 # ---------------------------
 
 _CURRENT_FILE = Path(__file__).resolve()
-_PROJECT_ROOT = _CURRENT_FILE.parent.parent  # /opt/argus
+_PROJECT_ROOT = _CURRENT_FILE.parent.parent  # runtime/argus
 
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -58,6 +67,7 @@ if _env is not None:
 else:
     load_dotenv(override=False)
 
+
 # ---------------------------
 # Broker import
 # ---------------------------
@@ -66,9 +76,27 @@ try:
     from src.real_broker import RealBroker
 except ImportError as e:
     print(f"❌ CRITICAL IMPORT ERROR: {e}")
-    sys.exit(1)
+    raise SystemExit(1)
 
 _broker = RealBroker()
+
+
+# ---------------------------
+# Constants / Runtime assets
+# ---------------------------
+
+MODELS_DIR = _PROJECT_ROOT / "models"
+MODEL_FILE = os.getenv("ARGUS_MODEL_FILE", "random_forest.pkl")
+DATA_FILE = _PROJECT_ROOT / "flight_recorder.csv"
+
+CORTEX_FILE = _PROJECT_ROOT / "cortex.json"
+CORTEX_TMP = _PROJECT_ROOT / "cortex.json.tmp"
+
+STATE_FILE = _PROJECT_ROOT / "trade_state.json"  # legacy compat
+
+PRODUCT_ID = "BTC-USD"
+ARGUS_MODE = os.getenv("ARGUS_MODE", "legacy").strip().lower()
+
 
 # ---------------------------
 # Helpers
@@ -76,22 +104,18 @@ _broker = RealBroker()
 
 _PROVENANCE_PRINTED = False
 
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
-def _utc_ts() -> str:
+
+def _utc_ts_str() -> str:
     return _utc_now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
-def _atomic_write_json(path: Path, tmp: Path, payload: dict) -> None:
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, separators=(",", ":"), sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
 
 def _safe_float(x, default: float = 0.0) -> float:
     try:
@@ -102,64 +126,54 @@ def _safe_float(x, default: float = 0.0) -> float:
     except Exception:
         return default
 
+
 def _parse_bool_env(name: str, default: bool = False) -> bool:
     v = os.getenv(name, "")
     if v == "":
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 def _is_dry_run() -> bool:
-    # Primary switch is ARGUS_DRY_RUN (since RealBroker prints its mode from this)
-    # PRIME_DRY_RUN exists to force dry-run when ARGUS_DRY_RUN isn't already set.
     return _parse_bool_env("ARGUS_DRY_RUN", False) or _parse_bool_env("PRIME_DRY_RUN", False)
 
-# ---------------------------
-# Shared runtime assets
-# ---------------------------
 
-MODELS_DIR = _PROJECT_ROOT / "models"
-MODEL_FILE = os.getenv("ARGUS_MODEL_FILE", "random_forest.pkl")
+def _atomic_write_json(path: Path, tmp: Path, payload: dict) -> None:
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
-DATA_FILE = _PROJECT_ROOT / "flight_recorder.csv"
 
-# Legacy state + cortex (kept for compatibility)
-STATE_FILE = _PROJECT_ROOT / "trade_state.json"
-CORTEX_FILE = _PROJECT_ROOT / "cortex.json"
-CORTEX_TMP = _PROJECT_ROOT / "cortex.json.tmp"
+def _load_external_strategy() -> Callable[..., Any] | None:
+    mod = os.getenv("ARGUS_STRATEGY_MODULE", "").strip()
+    fn = os.getenv("ARGUS_STRATEGY_FUNC", "").strip()
+    if not mod or not fn:
+        return None
+    try:
+        m = importlib.import_module(mod)
+        f = getattr(m, fn)
+        if not callable(f):
+            raise TypeError("Strategy func is not callable")
+        return f
+    except Exception as e:
+        print(f"   >> [STRATEGY] HOLD | Reason: STRATEGY_LOAD_FAIL | module={mod} func={fn} err={e}")
+        return None
 
-PRODUCT_ID = "BTC-USD"
 
-# ---------------------------
-# PRIME config (env)
-# ---------------------------
+def _call_external_strategy(fn: Callable[..., Any], df: pd.DataFrame, ctx: "StrategyContext") -> Any:
+    try:
+        return fn(df=df, ctx=ctx)
+    except TypeError:
+        pass
+    try:
+        return fn(df, ctx)
+    except TypeError:
+        pass
+    return fn(df=df, ctx=ctx, mode=ctx.mode, now_utc=ctx.now_utc)
 
-ARGUS_MODE = os.getenv("ARGUS_MODE", "legacy").strip().lower()
-
-PRIME_CONF_MIN = _safe_float(os.getenv("PRIME_CONF_MIN", "0.64"), 0.64)
-PRIME_HORIZON_H = int(_safe_float(os.getenv("PRIME_HORIZON", "48"), 48))
-PRIME_MAX_EXPOSURE = _safe_float(os.getenv("PRIME_MAX_EXPOSURE", "0.25"), 0.25)
-
-PRIME_DD_SOFT = _safe_float(os.getenv("PRIME_DD_SOFT", "0.03"), 0.03)
-PRIME_DD_HARD = _safe_float(os.getenv("PRIME_DD_HARD", "0.06"), 0.06)
-PRIME_DD_KILL = _safe_float(os.getenv("PRIME_DD_KILL", "0.10"), 0.10)
-
-# When below soft DD, cut exposure by this factor (0.5 = half size)
-PRIME_DD_SOFT_MULT = _safe_float(os.getenv("PRIME_DD_SOFT_MULT", "0.5"), 0.5)
-
-# Minimum notional to avoid dust
-PRIME_MIN_NOTIONAL_USD = _safe_float(os.getenv("PRIME_MIN_NOTIONAL_USD", "5.00"), 5.00)
-
-# Prime state files (paper vs live)
-PRIME_STATE_FILE_LIVE = _PROJECT_ROOT / "prime_state.json"
-PRIME_STATE_TMP_LIVE  = _PROJECT_ROOT / "prime_state.json.tmp"
-
-PRIME_STATE_FILE_PAPER = _PROJECT_ROOT / "paper_prime_state.json"
-PRIME_STATE_TMP_PAPER  = _PROJECT_ROOT / "paper_prime_state.json.tmp"
-
-# If PRIME_DRY_RUN is set, enforce dry-run (without overriding systemd if already set)
-if _parse_bool_env("PRIME_DRY_RUN", default=False):
-    if os.getenv("ARGUS_DRY_RUN") is None:
-        os.environ["ARGUS_DRY_RUN"] = "1"
 
 # ---------------------------
 # Market data update
@@ -210,14 +224,67 @@ def update_market_data() -> None:
     except Exception as e:
         print(f"   >> ⚠️ Data Update Glitch: {e}")
 
-# ---------------------------
-# PRIME state
-# ---------------------------
+
+# ============================================================
+# STRATEGY INTERFACE (Intent)
+# ============================================================
+
+class Action:
+    ENTER_LONG = "ENTER_LONG"
+    EXIT_LONG = "EXIT_LONG"
+    FLAT = "FLAT"
+    HOLD = "HOLD"
+
+
+@dataclass
+class StrategyContext:
+    mode: str
+    dry_run: bool
+    model_file: str
+    model_path: str
+    now_utc: datetime
+
+
+@dataclass
+class StrategyIntent:
+    action: str
+    confidence: float | None = None
+    desired_exposure_frac: float | None = None
+    horizon_hours: int | None = None
+    reason: str = "n/a"
+    meta: dict | None = None
+
+
+# ============================================================
+# PRIME (state + governors)
+# ============================================================
+
+PRIME_CONF_MIN = _safe_float(os.getenv("PRIME_CONF_MIN", "0.64"), 0.64)
+PRIME_HORIZON_H = int(_safe_float(os.getenv("PRIME_HORIZON", "48"), 48))
+PRIME_MAX_EXPOSURE = _safe_float(os.getenv("PRIME_MAX_EXPOSURE", "0.25"), 0.25)
+
+PRIME_DD_SOFT = _safe_float(os.getenv("PRIME_DD_SOFT", "0.03"), 0.03)
+PRIME_DD_HARD = _safe_float(os.getenv("PRIME_DD_HARD", "0.06"), 0.06)
+PRIME_DD_KILL = _safe_float(os.getenv("PRIME_DD_KILL", "0.10"), 0.10)
+PRIME_DD_SOFT_MULT = _safe_float(os.getenv("PRIME_DD_SOFT_MULT", "0.5"), 0.5)
+
+PRIME_MIN_NOTIONAL_USD = _safe_float(os.getenv("PRIME_MIN_NOTIONAL_USD", "5.00"), 5.00)
+
+# Generic churn-control gates (Prime only)
+PRIME_REENTRY_COOLDOWN_H = _safe_float(os.getenv("PRIME_REENTRY_COOLDOWN_H", "0"), 0.0)
+PRIME_EXIT_MIN_HOLD_H = _safe_float(os.getenv("PRIME_EXIT_MIN_HOLD_H", "0"), 0.0)
+
+PRIME_STATE_FILE_LIVE = _PROJECT_ROOT / "prime_state.json"
+PRIME_STATE_TMP_LIVE = _PROJECT_ROOT / "prime_state.json.tmp"
+PRIME_STATE_FILE_PAPER = _PROJECT_ROOT / "paper_prime_state.json"
+PRIME_STATE_TMP_PAPER = _PROJECT_ROOT / "paper_prime_state.json.tmp"
+
 
 def _prime_state_paths() -> tuple[Path, Path, str]:
     if _is_dry_run():
         return PRIME_STATE_FILE_PAPER, PRIME_STATE_TMP_PAPER, "paper"
     return PRIME_STATE_FILE_LIVE, PRIME_STATE_TMP_LIVE, "live"
+
 
 def _load_prime_state() -> dict:
     state_path, _tmp, _mode = _prime_state_paths()
@@ -231,6 +298,7 @@ def _load_prime_state() -> dict:
             "entry_px": None,
             "qty_btc": None,
             "planned_exit_ts": None,
+            "last_exit_ts": None,   # <- added
             "last_decision": None,
         }
     try:
@@ -238,30 +306,24 @@ def _load_prime_state() -> dict:
             st = json.load(f)
         if not isinstance(st, dict):
             raise ValueError("prime_state is not a dict")
+        # forward-fill new keys
+        st.setdefault("last_exit_ts", None)
+        st.setdefault("last_decision", None)
         return st
     except Exception:
-        # Corrupt -> fail safe: do not enter new trades
         return {"killed": True, "corrupt": True}
+
 
 def _save_prime_state(st: dict) -> None:
     state_path, tmp_path, _mode = _prime_state_paths()
     _atomic_write_json(state_path, tmp_path, st)
 
-# ---------------------------
-# PRIME sizing + DD governors
-# ---------------------------
 
 def _dd_status(equity: float, peak: float) -> tuple[float, str, float]:
-    """
-    Returns (dd_frac_negative, dd_band, exposure_mult)
-    dd_frac_negative: negative number (e.g. -0.04 means -4% drawdown)
-    dd_band: "ok" | "soft" | "hard" | "kill"
-    exposure_mult: multiplier applied to PRIME_MAX_EXPOSURE for new entries
-    """
     if peak <= 0:
         return 0.0, "ok", 1.0
-    dd = equity / peak - 1.0  # <= 0
 
+    dd = equity / peak - 1.0
     soft = -abs(PRIME_DD_SOFT)
     hard = -abs(PRIME_DD_HARD)
     kill = -abs(PRIME_DD_KILL)
@@ -274,26 +336,23 @@ def _dd_status(equity: float, peak: float) -> tuple[float, str, float]:
         return dd, "soft", _clamp01(PRIME_DD_SOFT_MULT)
     return dd, "ok", 1.0
 
-# ---------------------------
-# PRIME features + proba
-# ---------------------------
 
 def _build_prime_features(df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
-    """
-    Returns (feature_df, last_price)
-    Feature columns must match training: RSI, BB_Pos, Vol_Z
-    """
     df = df.copy()
     df["RSI"] = ta.rsi(df["Close"], length=14)
 
     bband = ta.bbands(df["Close"], length=20, std=2)
     if bband is None or bband.shape[1] < 3:
         raise RuntimeError("BBANDS_UNAVAILABLE")
-    df["BB_Pos"] = (df["Close"] - bband.iloc[:, 0]) / (bband.iloc[:, 2] - bband.iloc[:, 0])
+
+    lower = bband.iloc[:, 0]
+    upper = bband.iloc[:, 2]
+    denom = (upper - lower).replace(0, pd.NA)
+    df["BB_Pos"] = (df["Close"] - lower) / denom
 
     vol_mean = df["Volume"].rolling(20).mean()
-    vol_std = df["Volume"].rolling(20).std()
-    df["Vol_Z"] = (df["Volume"] - vol_mean) / vol_std.replace(0, pd.NA)
+    vol_std = df["Volume"].rolling(20).std().replace(0, pd.NA)
+    df["Vol_Z"] = (df["Volume"] - vol_mean) / vol_std
 
     feat_row = [df["RSI"].iloc[-1], df["BB_Pos"].iloc[-1], df["Vol_Z"].iloc[-1]]
     if any(pd.isna(x) for x in feat_row):
@@ -305,288 +364,10 @@ def _build_prime_features(df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
         raise RuntimeError("BAD_PRICE")
     return feat, price
 
-# ---------------------------
-# PRIME engine
-# ---------------------------
 
-def _run_prime() -> None:
-    global _PROVENANCE_PRINTED
-
-    cycle_start = _utc_ts()
-    dry = _is_dry_run()
-    state_path, _tmp, state_mode = _prime_state_paths()
-
-    if not _PROVENANCE_PRINTED:
-        print("   >> [PROVENANCE] signal_generator loaded from:", str(_CURRENT_FILE))
-        print("   >> [PROVENANCE] project_root:", str(_PROJECT_ROOT))
-        print("   >> [PROVENANCE] ARGUS_MODE:", ARGUS_MODE)
-        print("   >> [PROVENANCE] DRY_RUN:", str(dry))
-        print("   >> [PROVENANCE] PRIME_STATE_MODE:", state_mode)
-        print("   >> [PROVENANCE] PRIME_STATE_FILE:", str(state_path))
-        print("   >> [PROVENANCE] MODEL_FILE:", str(MODEL_FILE))
-        print("   >> [PROVENANCE] DATA_FILE:", str(DATA_FILE))
-        print("   >> [PROVENANCE] PRIME_CONF_MIN:", PRIME_CONF_MIN)
-        print("   >> [PROVENANCE] PRIME_HORIZON_H:", PRIME_HORIZON_H)
-        print("   >> [PROVENANCE] PRIME_MAX_EXPOSURE:", PRIME_MAX_EXPOSURE)
-        print("   >> [PROVENANCE] PRIME_DD_SOFT/HARD/KILL:", PRIME_DD_SOFT, PRIME_DD_HARD, PRIME_DD_KILL)
-        _PROVENANCE_PRINTED = True
-
-    update_market_data()
-
-    # Load model + data
-    try:
-        model_path = MODELS_DIR / MODEL_FILE
-        print ("   >>[PROVENANCE] MODEL_PATH:", str(model_path))
-        model = joblib.load(model_path)
-        df = pd.read_csv(DATA_FILE)
-    except Exception as e:
-        print(f"   >> [PRIME] HOLD | Reason: MODEL_OR_DATA_LOAD_FAIL | Error: {e}")
-        return
-
-    if df.empty or len(df) < 210:
-        print("   >> [PRIME] HOLD | Reason: INSUFFICIENT_HISTORY")
-        return
-
-    # Features + proba
-    try:
-        feat, price = _build_prime_features(df)
-        if not hasattr(model, "predict_proba"):
-            raise RuntimeError("MODEL_NO_PREDICT_PROBA")
-        p_long = float(model.predict_proba(feat)[0][1])
-    except Exception as e:
-        print(f"   >> [PRIME] HOLD | Reason: FEATURES_OR_PROBA_FAIL | Error: {e}")
-        return
-
-    # Wallet snapshot (Prime always fail-closed on entry if wallet unverified)
-    wallet_verified = False
-    cash = 0.0
-    btc = 0.0
-    wallet_err = None
-    try:
-        cash, btc = _broker.get_wallet_snapshot()
-        wallet_verified = True
-    except Exception as e:
-        wallet_err = str(e)
-
-    equity = cash + btc * price
-    btc_notional = btc * price
-
-    st = _load_prime_state()
-    if st.get("killed") is True:
-        print("   >> [PRIME] KILLED STATE ACTIVE -> no entries until reset state file")
-
-        # In LIVE, liquidate from wallet. In DRY-RUN, liquidate from paper state (best-effort).
-        if wallet_verified:
-            if dry:
-                paper_qty = _safe_float(st.get("qty_btc"), 0.0)
-                paper_in_pos = bool(st.get("in_position", False))
-                paper_notional = paper_qty * price
-                if paper_in_pos and paper_notional >= PRIME_MIN_NOTIONAL_USD and paper_qty > 0:
-                    print("   >> [PRIME] KILLED (DRY) -> LIQUIDATING PAPER BTC (best-effort)")
-                    _broker.execute_trade("SELL", paper_qty, price)
-            else:
-                if btc_notional >= PRIME_MIN_NOTIONAL_USD and btc > 0:
-                    print("   >> [PRIME] KILLED -> LIQUIDATING REMAINING BTC (best-effort)")
-                    _broker.execute_trade("SELL", btc, price)
-        return
-
-    if st.get("corrupt") is True:
-        print("   >> [PRIME] HOLD | Reason: PRIME_STATE_CORRUPT_FAILSAFE (treated as killed)")
-        return
-
-    # Update peak equity
-    peak = _safe_float(st.get("peak_equity_usd"), equity)
-    if peak <= 0:
-        peak = equity
-    if equity > peak:
-        peak = equity
-
-    dd, dd_band, dd_expo_mult = _dd_status(equity=equity, peak=peak)
-
-    # Prime decision: desired = long if p_long >= conf, else flat
-    want_long = p_long >= PRIME_CONF_MIN
-
-    # ---------------------------
-    # Position authority
-    # LIVE: wallet BTC is authoritative
-    # DRY : paper prime state is authoritative (prevents repeated re-entries)
-    # ---------------------------
-    btc_for_exit = btc  # default
-    if dry:
-        paper_qty = _safe_float(st.get("qty_btc"), 0.0)
-        paper_in_pos = bool(st.get("in_position", False))
-        paper_notional = paper_qty * price
-        in_pos = bool(paper_in_pos and (paper_notional >= PRIME_MIN_NOTIONAL_USD) and (paper_qty > 0))
-        btc_for_exit = paper_qty
-    else:
-        in_pos = btc_notional >= PRIME_MIN_NOTIONAL_USD
-        btc_for_exit = btc
-
-    now = _utc_now()
-    planned_exit_ts = None
-    if st.get("planned_exit_ts"):
-        try:
-            planned_exit_ts = datetime.fromisoformat(st["planned_exit_ts"])
-            if planned_exit_ts.tzinfo is None:
-                planned_exit_ts = planned_exit_ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            planned_exit_ts = None
-
-    # Kill rule
-    if dd_band == "kill":
-        if wallet_verified and in_pos and btc_for_exit > 0:
-            print(f"   >> [PRIME] DD_KILL TRIGGERED (dd={dd:.3%}) -> FORCED LIQUIDATION")
-            _broker.execute_trade("SELL", btc_for_exit, price)
-        st["killed"] = True
-        st["last_decision"] = f"KILL_DD dd={dd:.6f}"
-        st["peak_equity_usd"] = peak
-        st["last_equity_usd"] = equity
-        _save_prime_state(st)
-        return
-
-    # Horizon exit
-    if wallet_verified and in_pos and planned_exit_ts is not None and now >= planned_exit_ts:
-        print(f"   >> [PRIME] EXIT: HORIZON_REACHED -> SELL ALL | p={p_long:.3f} conf={PRIME_CONF_MIN:.2f}")
-        if btc_for_exit > 0:
-            _broker.execute_trade("SELL", btc_for_exit, price)
-        st.update(
-            {
-                "in_position": False,
-                "entry_ts": None,
-                "entry_px": None,
-                "qty_btc": None,
-                "planned_exit_ts": None,
-                "last_decision": "EXIT_HORIZON",
-                "peak_equity_usd": peak,
-                "last_equity_usd": equity,
-            }
-        )
-        _save_prime_state(st)
-        return
-
-    # Hard DD: no new entries
-    if dd_band == "hard":
-        print(f"   >> [PRIME] HARD_DD (dd={dd:.3%}) -> entries blocked (exits allowed)")
-        st["peak_equity_usd"] = peak
-        st["last_equity_usd"] = equity
-        st["last_decision"] = f"HARD_DD_BLOCK dd={dd:.6f}"
-        _save_prime_state(st)
-        return
-
-    # In position: do nothing until horizon
-    if in_pos:
-        if planned_exit_ts is None:
-            planned_exit_ts = now + timedelta(hours=PRIME_HORIZON_H)
-            st["planned_exit_ts"] = planned_exit_ts.isoformat()
-        st["in_position"] = True
-        st["peak_equity_usd"] = peak
-        st["last_equity_usd"] = equity
-        st["last_decision"] = f"HOLD_IN_POSITION p={p_long:.4f}"
-        _save_prime_state(st)
-
-        print(
-            f"   >> [PRIME] HOLD (IN POSITION) | p={p_long:.3f} conf={PRIME_CONF_MIN:.2f} | "
-            f"equity=${equity:.2f} dd={dd:.3%} band={dd_band} | exit_at={planned_exit_ts.isoformat() if planned_exit_ts else 'n/a'}"
-        )
-        return
-
-    # Flat: no entry
-    if not want_long:
-        st["in_position"] = False
-        st["peak_equity_usd"] = peak
-        st["last_equity_usd"] = equity
-        st["last_decision"] = f"FLAT_NO_SIGNAL p={p_long:.4f}"
-        _save_prime_state(st)
-        print(f"   >> [PRIME] FLAT | No entry signal | p={p_long:.3f} conf={PRIME_CONF_MIN:.2f}")
-        return
-
-    # Entry requires verified wallet snapshot (even in DRY-RUN, we still want the balance sanity check)
-    if not wallet_verified:
-        print(f"   >> [PRIME] HOLD | Reason: WALLET_UNVERIFIED_FAIL_CLOSED_ENTRY | err={wallet_err}")
-        return
-
-    effective_max_exposure = PRIME_MAX_EXPOSURE * dd_expo_mult
-
-    if effective_max_exposure <= 0:
-        print(f"   >> [PRIME] HOLD | Reason: EXPOSURE_ZERO (dd_band={dd_band})")
-        st["peak_equity_usd"] = peak
-        st["last_equity_usd"] = equity
-        st["last_decision"] = f"BLOCKED_EXPO band={dd_band}"
-        _save_prime_state(st)
-        return
-
-    target_usd = equity * effective_max_exposure
-    target_usd = min(target_usd, cash)
-
-    if target_usd < PRIME_MIN_NOTIONAL_USD:
-        print(f"   >> [PRIME] HOLD | Reason: TARGET_BELOW_MIN_NOTIONAL | target=${target_usd:.2f}")
-        st["peak_equity_usd"] = peak
-        st["last_equity_usd"] = equity
-        st["last_decision"] = "TARGET_TOO_SMALL"
-        _save_prime_state(st)
-        return
-
-    qty = target_usd / price
-    planned_exit_ts = now + timedelta(hours=PRIME_HORIZON_H)
-
-    print(
-        f"   >> [PRIME] ENTER LONG | p={p_long:.3f} conf={PRIME_CONF_MIN:.2f} | "
-        f"equity=${equity:.2f} cash=${cash:.2f} dd={dd:.3%} band={dd_band} | "
-        f"maxExpo={PRIME_MAX_EXPOSURE:.3f} effExpo={effective_max_exposure:.3f} | "
-        f"target=${target_usd:.2f} qty={qty:.8f} px=${price:.2f} | exit_at={planned_exit_ts.isoformat()}"
-    )
-
-    _broker.execute_trade("BUY", qty, price)
-
-    st.update(
-        {
-            "killed": False,
-            "peak_equity_usd": peak,
-            "last_equity_usd": equity,
-            "in_position": True,
-            "entry_ts": now.isoformat(),
-            "entry_px": price,
-            "qty_btc": qty,
-            "planned_exit_ts": planned_exit_ts.isoformat(),
-            "last_decision": f"ENTER_LONG p={p_long:.4f}",
-        }
-    )
-    _save_prime_state(st)
-
-    # Dashboard update
-    try:
-        _atomic_write_json(
-            CORTEX_FILE,
-            CORTEX_TMP,
-            {
-                "timestamp_utc": cycle_start,
-                "mode": "prime",
-                "p_long": p_long,
-                "conf_min": PRIME_CONF_MIN,
-                "horizon_h": PRIME_HORIZON_H,
-                "max_exposure": PRIME_MAX_EXPOSURE,
-                "equity_usd": float(equity),
-                "cash_usd": float(cash) if wallet_verified else None,
-                "btc": float(btc) if wallet_verified else None,
-                "btc_notional_usd": float(btc_notional) if wallet_verified else None,
-                "peak_equity_usd": float(peak),
-                "drawdown_frac": float(dd),
-                "dd_band": dd_band,
-                "planned_exit_ts": st.get("planned_exit_ts"),
-                "last_decision": st.get("last_decision"),
-                "model_file": str(MODEL_FILE),
-                "model_path": str((MODELS_DIR / MODEL_FILE)),
-                "dry_run": bool(dry),
-                "prime_state_file": str(state_path),
-            },
-        )
-    except Exception:
-        pass
-
-
-# ---------------------------
-# LEGACY engine (your existing V3.6)
-# ---------------------------
+# ============================================================
+# LEGACY (unchanged)
+# ============================================================
 
 MIN_NOTIONAL_USD = float(os.getenv("ARGUS_MIN_NOTIONAL_USD", "5.0"))
 MIN_HOLD_HOURS = float(os.getenv("ARGUS_MIN_HOLD_HOURS", "4.0"))
@@ -597,7 +378,8 @@ MAX_HOLD_HOURS = float(os.getenv("ARGUS_MAX_HOLD_HOURS", "72.0"))
 HURDLE_RELIEF_SEVERITY = float(os.getenv("ARGUS_HURDLE_RELIEF_SEVERITY", "0.60"))
 HURDLE_RELIEF_FACTOR = float(os.getenv("ARGUS_HURDLE_RELIEF_FACTOR", "0.5"))
 
-def detect_regime(df: pd.DataFrame):
+
+def detect_regime_legacy(df: pd.DataFrame):
     sma_50 = ta.sma(df["Close"], length=50)
     sma_200 = ta.sma(df["Close"], length=200)
     atr = ta.atr(df["High"], df["Low"], df["Close"], length=14)
@@ -647,7 +429,8 @@ def detect_regime(df: pd.DataFrame):
 
     return label, float(risk_mult), float(severity), bool(emergency_exit)
 
-def _load_trade_state():
+
+def _load_trade_state_legacy():
     if not STATE_FILE.exists():
         return None, "MISSING"
     try:
@@ -669,196 +452,747 @@ def _load_trade_state():
     except Exception:
         return None, "CORRUPT"
 
-def _run_legacy() -> None:
-    global _PROVENANCE_PRINTED
 
-    cycle_start = _utc_ts()
+# ============================================================
+# STRATEGIES (produce intents)
+# ============================================================
 
-    if not _PROVENANCE_PRINTED:
-        try:
-            print("   >> [PROVENANCE] signal_generator loaded from:", str(_CURRENT_FILE))
-            print("   >> [PROVENANCE] project_root:", str(_PROJECT_ROOT))
-            print("   >> [PROVENANCE] MODELS_DIR:", str(MODELS_DIR))
-            print("   >> [PROVENANCE] MODEL_FILE:", str(MODEL_FILE))
-            print("   >> [PROVENANCE] DATA_FILE:", str(DATA_FILE))
-            print("   >> [PROVENANCE] STATE_FILE:", str(STATE_FILE))
-            print("   >> [PROVENANCE] PRODUCT_ID:", str(PRODUCT_ID))
-        except Exception:
-            pass
-        _PROVENANCE_PRINTED = True
+class PrimeModelStrategy:
+    def __init__(self, model):
+        self.model = model
 
-    update_market_data()
+    def get_intent(self, df: pd.DataFrame, ctx: StrategyContext) -> tuple[StrategyIntent, float]:
+        feat, price = _build_prime_features(df)
 
+        if not hasattr(self.model, "predict_proba"):
+            return StrategyIntent(action=Action.HOLD, reason="MODEL_NO_PREDICT_PROBA"), price
+
+        p_long = float(self.model.predict_proba(feat)[0][1])
+        want_long = p_long >= PRIME_CONF_MIN
+
+        if want_long:
+            return StrategyIntent(
+                action=Action.ENTER_LONG,
+                confidence=p_long,
+                desired_exposure_frac=PRIME_MAX_EXPOSURE,
+                horizon_hours=PRIME_HORIZON_H,
+                reason=f"p_long>=conf ({p_long:.3f}>={PRIME_CONF_MIN:.2f})",
+                meta={"p_long": p_long, "conf_min": PRIME_CONF_MIN},
+            ), price
+
+        return StrategyIntent(
+            action=Action.FLAT,
+            confidence=p_long,
+            reason=f"p_long<conf ({p_long:.3f}<{PRIME_CONF_MIN:.2f})",
+            meta={"p_long": p_long, "conf_min": PRIME_CONF_MIN},
+        ), price
+
+
+class LegacyModelStrategy:
+    def __init__(self, model):
+        self.model = model
+
+    def get_intent(self, df: pd.DataFrame, ctx: StrategyContext) -> tuple[StrategyIntent, float, dict]:
+        df2 = df.copy()
+        df2["RSI"] = ta.rsi(df2["Close"], length=14)
+        bband = ta.bbands(df2["Close"], length=20, std=2)
+        if bband is None or bband.shape[1] < 3:
+            price = float(df2["Close"].iloc[-1])
+            return StrategyIntent(action=Action.HOLD, reason="BBANDS_UNAVAILABLE"), price, {}
+
+        lower = bband.iloc[:, 0]
+        upper = bband.iloc[:, 2]
+        denom = (upper - lower).replace(0, pd.NA)
+        df2["BB_Pos"] = (df2["Close"] - lower) / denom
+
+        vol_mean = df2["Volume"].rolling(20).mean()
+        vol_std = df2["Volume"].rolling(20).std().replace(0, pd.NA)
+        df2["Vol_Z"] = (df2["Volume"] - vol_mean) / vol_std
+
+        feat_row = [df2["RSI"].iloc[-1], df2["BB_Pos"].iloc[-1], df2["Vol_Z"].iloc[-1]]
+        if any(pd.isna(x) for x in feat_row):
+            price = float(df2["Close"].iloc[-1])
+            return StrategyIntent(action=Action.HOLD, reason="FEATURES_NAN"), price, {}
+
+        feat = pd.DataFrame([feat_row], columns=["RSI", "BB_Pos", "Vol_Z"])
+        price = float(df2["Close"].iloc[-1])
+        if not (price > 0):
+            return StrategyIntent(action=Action.HOLD, reason="BAD_PRICE"), 0.0, {}
+
+        regime, risk_mult, severity, emergency_exit = detect_regime_legacy(df2)
+        raw_signal = "BUY" if int(self.model.predict(feat)[0]) == 1 else "SELL"
+
+        meta = {
+            "regime": regime,
+            "risk_mult": float(risk_mult),
+            "severity": float(severity),
+            "emergency_exit": bool(emergency_exit),
+            "raw_signal": raw_signal,
+        }
+
+        if raw_signal == "BUY":
+            return StrategyIntent(
+                action=Action.ENTER_LONG,
+                confidence=None,
+                desired_exposure_frac=_clamp01(float(risk_mult)),
+                reason=f"LEGACY_BUY ({regime})",
+                meta=meta,
+            ), price, meta
+
+        return StrategyIntent(
+            action=Action.EXIT_LONG,
+            confidence=None,
+            reason=f"LEGACY_SELL ({regime})",
+            meta=meta,
+        ), price, meta
+
+
+# ============================================================
+# SG EXECUTION LAYER
+# ============================================================
+
+def _load_model() -> tuple[object | None, str]:
     try:
         model_path = MODELS_DIR / MODEL_FILE
         model = joblib.load(model_path)
+        return model, str(model_path)
+    except Exception as e:
+        return None, f"{e}"
+
+
+def _load_data() -> pd.DataFrame | None:
+    try:
         df = pd.read_csv(DATA_FILE)
-    except Exception as e:
-        print(f"   >> [DECISION] HOLD | Reason: MODEL_OR_DATA_LOAD_FAIL | Error: {e}")
-        return
+        return df
+    except Exception:
+        return None
 
-    if df.empty or len(df) < 210:
-        print("   >> [DECISION] HOLD | Reason: INSUFFICIENT_HISTORY")
-        return
 
-    try:
-        df["RSI"] = ta.rsi(df["Close"], length=14)
-        bband = ta.bbands(df["Close"], length=20, std=2)
-        if bband is None or bband.shape[1] < 3:
-            print("   >> [DECISION] HOLD | Reason: BBANDS_UNAVAILABLE")
-            return
-
-        df["BB_Pos"] = (df["Close"] - bband.iloc[:, 0]) / (bband.iloc[:, 2] - bband.iloc[:, 0])
-
-        vol_mean = df["Volume"].rolling(20).mean()
-        vol_std = df["Volume"].rolling(20).std()
-        df["Vol_Z"] = (df["Volume"] - vol_mean) / vol_std.replace(0, pd.NA)
-
-        feat_row = [df["RSI"].iloc[-1], df["BB_Pos"].iloc[-1], df["Vol_Z"].iloc[-1]]
-        if any(pd.isna(x) for x in feat_row):
-            print("   >> [DECISION] HOLD | Reason: FEATURES_NAN")
-            return
-
-        feat = pd.DataFrame([feat_row], columns=["RSI", "BB_Pos", "Vol_Z"])
-        price = float(df["Close"].iloc[-1])
-        if not (price > 0):
-            print("   >> [DECISION] HOLD | Reason: BAD_PRICE")
-            return
-    except Exception as e:
-        print(f"   >> [DECISION] HOLD | Reason: FEATURE_ENGINEERING_FAIL | Error: {e}")
-        return
-
-    try:
-        regime, risk_mult, severity, emergency_exit = detect_regime(df)
-        raw_signal = "BUY" if int(model.predict(feat)[0]) == 1 else "SELL"
-    except Exception as e:
-        print(f"   >> [DECISION] HOLD | Reason: REGIME_OR_MODEL_PREDICT_FAIL | Error: {e}")
-        return
-
-    wallet_verified = False
-    cash = 0.0
-    btc = 0.0
-    wallet_err = None
+def _wallet_snapshot(price: float) -> tuple[bool, float, float, float, str | None]:
     try:
         cash, btc = _broker.get_wallet_snapshot()
-        wallet_verified = True
+        equity = float(cash) + float(btc) * float(price)
+        return True, float(cash), float(btc), float(equity), None
     except Exception as e:
-        wallet_err = str(e)
+        return False, 0.0, 0.0, 0.0, str(e)
 
-    btc_notional = btc * price
 
-    print(f"   >> [BRAIN] Raw Signal: {raw_signal}")
-    print(
-        f"   >> [REGIME] {regime} | Risk Multiplier: {risk_mult:.2f} | Severity: {severity:.2f} | EmergencyExit: {str(emergency_exit)}"
-    )
-    if wallet_verified:
-        print(f"   >> [WALLET] VERIFIED | Cash: ${cash:.2f} | BTC: {btc:.8f} | BTC Notional: ${btc_notional:.2f}")
+def _write_cortex(payload: dict) -> None:
+    try:
+        _atomic_write_json(CORTEX_FILE, CORTEX_TMP, payload)
+    except Exception:
+        pass
+
+
+def _debug_asserts_enabled() -> bool:
+    return _parse_bool_env("ARGUS_DEBUG_ASSERTS", False)
+
+
+def _build_cortex_payload(
+    *,
+    cycle_start: str,
+    prime_state: dict,
+    execution_branch: str,
+    intent: "StrategyIntent",
+    price: float,
+    wallet_verified: bool,
+    cash: float,
+    btc: float,
+    equity: float,
+    peak: float,
+    dd: float,
+    dd_band: str,
+    model_path_str: str,
+    state_mode: str,
+    state_path: "Path",
+    dry: bool,
+    wallet_err: str | None = None,
+) -> dict:
+    """
+    Assemble cortex.json payload deterministically from authoritative sources:
+      - prime_state: freshly loaded from disk (authoritative for position state)
+      - wallet snapshot: authoritative for balances
+      - execution_branch: authoritative for last_decision (what actually happened THIS cycle)
+      - intent: current cycle's strategy intent
+    
+    HARD RULES:
+      - in_position is derived from prime_state
+      - planned_exit_ts is only included if in_position == True
+      - last_decision is the execution_branch from THIS cycle
+      - btc/cash/equity are from current wallet snapshot
+    """
+    in_position = bool(prime_state.get("in_position", False))
+    
+    # planned_exit_ts: only meaningful if in_position
+    if in_position:
+        planned_exit_ts = prime_state.get("planned_exit_ts")
     else:
-        print(f"   >> [WALLET] UNVERIFIED | Error: {wallet_err}")
+        planned_exit_ts = None
+    
+    # DEBUG assertions (only fire if ARGUS_DEBUG_ASSERTS=1)
+    if _debug_asserts_enabled():
+        # If not in position, planned_exit_ts in state must be None
+        if not prime_state.get("in_position", False):
+            assert prime_state.get("planned_exit_ts") is None, (
+                f"Invariant violation: in_position=False but planned_exit_ts={prime_state.get('planned_exit_ts')}"
+            )
+        # If we're writing a non-null planned_exit_ts, in_position must be True
+        if planned_exit_ts is not None:
+            assert in_position is True, (
+                f"Invariant violation: planned_exit_ts={planned_exit_ts} but in_position={in_position}"
+            )
+    
+    p_long = (intent.meta or {}).get("p_long", None)
+    btc_notional = btc * price if wallet_verified else None
+    
+    _ext_mod = os.getenv("ARGUS_STRATEGY_MODULE", "").strip()
+    _ext_fn = os.getenv("ARGUS_STRATEGY_FUNC", "").strip()
+    _is_external = bool(_ext_mod and _ext_fn)
+    
+    return {
+        "timestamp_utc": cycle_start,
+        "mode": "prime",
+        "in_position": in_position,
+        "intent_action": intent.action,
+        "intent_reason": intent.reason,
+        "execution_branch": execution_branch,
+        "last_decision": execution_branch,  # authoritative: what THIS cycle did
+        "p_long": p_long,
+        "conf_min": PRIME_CONF_MIN,
+        "horizon_h": intent.horizon_hours or PRIME_HORIZON_H,
+        "max_exposure": PRIME_MAX_EXPOSURE,
+        "equity_usd": float(equity) if wallet_verified else None,
+        "cash_usd": float(cash) if wallet_verified else None,
+        "btc": float(btc) if wallet_verified else None,
+        "btc_notional_usd": float(btc_notional) if btc_notional is not None else None,
+        "peak_equity_usd": float(peak),
+        "drawdown_frac": float(dd),
+        "dd_band": dd_band,
+        "planned_exit_ts": planned_exit_ts,  # None if not in_position
+        "entry_ts": prime_state.get("entry_ts") if in_position else None,
+        "entry_px": prime_state.get("entry_px") if in_position else None,
+        "model_file": str(MODEL_FILE),
+        "model_path": str(model_path_str),
+        "dry_run": bool(dry),
+        "prime_state_mode": state_mode,
+        "prime_state_file": str(state_path),
+        "wallet_verified": bool(wallet_verified),
+        "wallet_err": wallet_err,
+        "prime_reentry_cooldown_h": float(PRIME_REENTRY_COOLDOWN_H),
+        "prime_exit_min_hold_h": float(PRIME_EXIT_MIN_HOLD_H),
+        "external_strategy": _is_external,
+        "external_strategy_module": _ext_mod if _is_external else None,
+        "external_strategy_func": _ext_fn if _is_external else None,
+        "intent_source": "external" if _is_external else "internal",
+    }
+
+
+def _execute_buy(target_usd: float, price: float) -> float:
+    qty = target_usd / price
+    _broker.execute_trade("BUY", qty, price)
+    return qty
+
+
+def _execute_sell(qty_btc: float, price: float) -> None:
+    _broker.execute_trade("SELL", qty_btc, price)
+
+
+def _is_panic_exit(intent: StrategyIntent) -> bool:
+    r = (intent.reason or "").lower()
+    if "vol_panic" in r or "panic" in r:
+        return True
+    meta = intent.meta or {}
+    if isinstance(meta, dict) and meta.get("exit_kind") == "panic":
+        return True
+    return False
+
+
+def _run_prime_engine(df: pd.DataFrame, model, model_path_str: str) -> None:
+    cycle_start = _utc_ts_str()
+    dry = _is_dry_run()
+    now = _utc_now()
+
+    # FRESH state load from disk — authoritative for position state
+    st = _load_prime_state()
+    state_path, _tmp, state_mode = _prime_state_paths()
+
+    ctx = StrategyContext(
+        mode="prime",
+        dry_run=dry,
+        model_file=MODEL_FILE,
+        model_path=model_path_str,
+        now_utc=now,
+    )
+
+    # Helper to write cortex with current state
+    def write_cortex_for_branch(execution_branch: str) -> None:
+        cortex_payload = _build_cortex_payload(
+            cycle_start=cycle_start,
+            prime_state=st,
+            execution_branch=execution_branch,
+            intent=intent,
+            price=price,
+            wallet_verified=wallet_verified,
+            cash=cash,
+            btc=btc,
+            equity=current_equity,
+            peak=peak,
+            dd=dd,
+            dd_band=dd_band,
+            model_path_str=model_path_str,
+            state_mode=state_mode,
+            state_path=state_path,
+            dry=dry,
+            wallet_err=wallet_err,
+        )
+        _write_cortex(cortex_payload)
+
+    # Initialize defaults for early-exit branches
+    price = float(df["Close"].iloc[-1]) if len(df) > 0 else 0.0
+    intent = StrategyIntent(action=Action.HOLD, reason="INIT")
+    wallet_verified, cash, btc, equity, wallet_err = _wallet_snapshot(price=price)
+    btc_notional = btc * price
+    current_equity = equity if wallet_verified else _safe_float(st.get("last_equity_usd"), 0.0)
+    peak = _safe_float(st.get("peak_equity_usd"), current_equity)
+    if peak <= 0:
+        peak = current_equity
+    dd, dd_band, dd_expo_mult = _dd_status(equity=current_equity, peak=peak)
 
     try:
-        _atomic_write_json(
-            CORTEX_FILE,
-            CORTEX_TMP,
-            {
-                "timestamp_utc": cycle_start,
-                "regime": regime,
-                "risk_mult": float(risk_mult),
-                "severity": float(severity),
-                "raw_signal": raw_signal,
-                "wallet_verified": bool(wallet_verified),
-                "cash_usd": float(cash) if wallet_verified else None,
-                "btc": float(btc) if wallet_verified else None,
-                "btc_notional_usd": float(btc_notional) if wallet_verified else None,
-                "emergency_exit": bool(emergency_exit),
-                "model_file": str(MODEL_FILE),
-                "model_path": str(model_path),
-            },
-        )
+        external = _load_external_strategy()
+        if external:
+            out = _call_external_strategy(external, df=df, ctx=ctx)
+            if isinstance(out, StrategyIntent):
+                intent = out
+            elif isinstance(out, dict):
+                intent = StrategyIntent(**out)
+            else:
+                raise TypeError(f"Unsupported external strategy return type: {type(out)}")
+            price = float(df["Close"].iloc[-1])
+        else:
+            strat = PrimeModelStrategy(model)
+            intent, price = strat.get_intent(df, ctx)
+
+        p_long = (intent.meta or {}).get("p_long", None)
     except Exception as e:
-        print(f"   >> ⚠️ Dashboard write glitch: {e}")
-
-    if raw_signal == "BUY":
-        if not wallet_verified:
-            print("   >> [DECISION] HOLD | Reason: WALLET_UNVERIFIED_FAIL_CLOSED_BUY")
-            return
-        if risk_mult <= 0.0:
-            print(f"   >> [DECISION] HOLD | Reason: RISK_MULT_ZERO | Regime: {regime}")
-            return
-        if btc_notional >= MIN_NOTIONAL_USD:
-            print(
-                f"   >> [DECISION] HOLD | Reason: ALREADY_IN_POSITION_NO_PYRAMID | "
-                f"BTC_Notional: ${btc_notional:.2f}"
-            )
-            return
-
-        target_usd = cash * risk_mult
-        if target_usd < MIN_NOTIONAL_USD:
-            print(f"   >> [DECISION] HOLD | Reason: TARGET_BELOW_MIN_NOTIONAL | Target: ${target_usd:.2f}")
-            return
-
-        btc_qty = target_usd / price
-        print(
-            f"   >> [EXECUTION] ROUTE BUY | TargetUSD: ${target_usd:.2f} | QtyBTC: {btc_qty:.8f} | Price: ${price:.2f}"
-        )
-        _broker.execute_trade("BUY", btc_qty, price)
+        print(f"   >> [PRIME] HOLD | Reason: STRATEGY_INTENT_FAIL | Error: {e}")
+        st["last_decision"] = f"HOLD_STRATEGY_FAIL err={e}"
+        _save_prime_state(st)
+        write_cortex_for_branch(f"HOLD_STRATEGY_FAIL err={e}")
         return
 
-    if raw_signal == "SELL":
+    # Re-fetch wallet with updated price (in case price changed)
+    wallet_verified, cash, btc, equity, wallet_err = _wallet_snapshot(price=price)
+    btc_notional = btc * price
+    current_equity = equity if wallet_verified else _safe_float(st.get("last_equity_usd"), 0.0)
+    if current_equity > peak:
+        peak = current_equity
+
+    dd, dd_band, dd_expo_mult = _dd_status(equity=current_equity, peak=peak)
+
+    if st.get("corrupt") is True:
+        print("   >> [PRIME] HOLD | Reason: PRIME_STATE_CORRUPT_FAILSAFE (treated as killed)")
+        st["last_decision"] = "HOLD_STATE_CORRUPT"
+        write_cortex_for_branch("HOLD_STATE_CORRUPT")
+        return
+
+    if st.get("killed") is True:
+        print("   >> [PRIME] KILLED STATE ACTIVE -> no entries until reset state file")
+        if wallet_verified and btc_notional >= PRIME_MIN_NOTIONAL_USD and btc > 0:
+            print("   >> [PRIME] KILLED -> LIQUIDATING REMAINING BTC (best-effort)")
+            _execute_sell(btc, price)
+        st["last_decision"] = "KILLED_STATE_ACTIVE"
+        write_cortex_for_branch("KILLED_STATE_ACTIVE")
+        return
+
+    # In-position authority
+    if dry:
+        paper_qty = _safe_float(st.get("qty_btc"), 0.0)
+        paper_in_pos = bool(st.get("in_position", False))
+        paper_notional = paper_qty * price
+        in_pos = bool(paper_in_pos and (paper_notional >= PRIME_MIN_NOTIONAL_USD) and (paper_qty > 0))
+        qty_for_exit = paper_qty
+    else:
+        in_pos = btc_notional >= PRIME_MIN_NOTIONAL_USD
+        qty_for_exit = btc
+
+    # Parse entry_ts / planned_exit_ts / last_exit_ts
+    entry_ts = None
+    if st.get("entry_ts"):
+        try:
+            entry_ts = datetime.fromisoformat(st["entry_ts"])
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            entry_ts = None
+
+    planned_exit_ts = None
+    if st.get("planned_exit_ts"):
+        try:
+            planned_exit_ts = datetime.fromisoformat(st["planned_exit_ts"])
+            if planned_exit_ts.tzinfo is None:
+                planned_exit_ts = planned_exit_ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            planned_exit_ts = None
+
+    last_exit_ts = None
+    if st.get("last_exit_ts"):
+        try:
+            last_exit_ts = datetime.fromisoformat(st["last_exit_ts"])
+            if last_exit_ts.tzinfo is None:
+                last_exit_ts = last_exit_ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            last_exit_ts = None
+
+    # Kill rule
+    if dd_band == "kill":
+        if wallet_verified and in_pos and qty_for_exit > 0:
+            print(f"   >> [PRIME] DD_KILL TRIGGERED (dd={dd:.3%}) -> FORCED LIQUIDATION")
+            _execute_sell(qty_for_exit, price)
+        execution_branch = f"KILL_DD dd={dd:.6f}"
+        st["killed"] = True
+        st["in_position"] = False
+        st["planned_exit_ts"] = None
+        st["last_decision"] = execution_branch
+        st["peak_equity_usd"] = peak
+        st["last_equity_usd"] = current_equity
+        _save_prime_state(st)
+        write_cortex_for_branch(execution_branch)
+        return
+
+    # ----------------------------
+    # IN POSITION: exits + horizon + min-hold gate
+    # ----------------------------
+    if in_pos:
+        # Horizon schedule
+        if planned_exit_ts is None:
+            horizon_h = intent.horizon_hours or PRIME_HORIZON_H
+            planned_exit_ts = now + timedelta(hours=int(horizon_h))
+            st["planned_exit_ts"] = planned_exit_ts.isoformat()
+
+        # Strategy exit gate (with min-hold)
+        if intent.action == Action.EXIT_LONG and wallet_verified:
+            hold_hours = None
+            if entry_ts is not None:
+                hold_hours = (now - entry_ts).total_seconds() / 3600.0
+
+            panic = _is_panic_exit(intent)
+            if (not panic) and PRIME_EXIT_MIN_HOLD_H > 0 and hold_hours is not None and hold_hours < PRIME_EXIT_MIN_HOLD_H:
+                # Block early non-panic exits
+                execution_branch = f"MIN_HOLD_BLOCK exit intent={intent.reason} held={hold_hours:.2f}h min={PRIME_EXIT_MIN_HOLD_H:.2f}h"
+                st["in_position"] = True
+                st["peak_equity_usd"] = peak
+                st["last_equity_usd"] = current_equity
+                st["last_decision"] = execution_branch
+                _save_prime_state(st)
+                print(f"   >> [PRIME] HOLD (MIN_HOLD_BLOCK) | held={hold_hours:.2f}h < min={PRIME_EXIT_MIN_HOLD_H:.2f}h | reason={intent.reason}")
+                write_cortex_for_branch(execution_branch)
+            else:
+                # Execute strategy exit
+                execution_branch = f"EXIT_STRATEGY reason={intent.reason}"
+                print(f"   >> [PRIME] EXIT: STRATEGY_EXIT -> SELL ALL | reason={intent.reason} p={p_long} conf={PRIME_CONF_MIN:.2f}")
+                if qty_for_exit > 0:
+                    _execute_sell(qty_for_exit, price)
+
+                st.update(
+                    {
+                        "in_position": False,
+                        "entry_ts": None,
+                        "entry_px": None,
+                        "qty_btc": None,
+                        "planned_exit_ts": None,
+                        "last_exit_ts": now.isoformat(),
+                        "last_decision": execution_branch,
+                        "peak_equity_usd": peak,
+                        "last_equity_usd": current_equity,
+                    }
+                )
+                _save_prime_state(st)
+                write_cortex_for_branch(execution_branch)
+            return
+
+        # Horizon exit
+        if wallet_verified and planned_exit_ts is not None and now >= planned_exit_ts:
+            execution_branch = "EXIT_HORIZON"
+            print(f"   >> [PRIME] EXIT: HORIZON_REACHED -> SELL ALL | p={p_long} conf={PRIME_CONF_MIN:.2f}")
+            if qty_for_exit > 0:
+                _execute_sell(qty_for_exit, price)
+            st.update(
+                {
+                    "in_position": False,
+                    "entry_ts": None,
+                    "entry_px": None,
+                    "qty_btc": None,
+                    "planned_exit_ts": None,
+                    "last_exit_ts": now.isoformat(),
+                    "last_decision": execution_branch,
+                    "peak_equity_usd": peak,
+                    "last_equity_usd": current_equity,
+                }
+            )
+            _save_prime_state(st)
+            write_cortex_for_branch(execution_branch)
+            return
+
+        # HOLD
+        execution_branch = f"HOLD_IN_POSITION exec=HOLD intent={intent.action} p={p_long}"
+        st["in_position"] = True
+        st["peak_equity_usd"] = peak
+        st["last_equity_usd"] = current_equity
+        st["last_decision"] = execution_branch
+        _save_prime_state(st)
+
+        print(
+            f"   >> [PRIME] HOLD (IN POSITION) | exec=HOLD | "
+            f"intent={intent.action} | equity=${current_equity:.2f} dd={dd:.3%} band={dd_band} | "
+            f"exit_at={planned_exit_ts.isoformat() if planned_exit_ts else 'n/a'}"
+        )
+
+        write_cortex_for_branch(execution_branch)
+        return
+
+    # ----------------------------
+    # NOT IN POSITION: entry gates
+    # ----------------------------
+    if dd_band == "hard":
+        execution_branch = f"HARD_DD_BLOCK dd={dd:.6f}"
+        print(f"   >> [PRIME] HARD_DD (dd={dd:.3%}) -> entries blocked")
+        st["in_position"] = False
+        st["planned_exit_ts"] = None
+        st["peak_equity_usd"] = peak
+        st["last_equity_usd"] = current_equity
+        st["last_decision"] = execution_branch
+        _save_prime_state(st)
+        write_cortex_for_branch(execution_branch)
+        return
+
+    # If strategy isn't asking to enter, remain flat
+    if intent.action not in (Action.ENTER_LONG,):
+        execution_branch = f"FLAT_NO_ENTRY intent={intent.action}"
+        st["in_position"] = False
+        st["planned_exit_ts"] = None
+        st["peak_equity_usd"] = peak
+        st["last_equity_usd"] = current_equity
+        st["last_decision"] = execution_branch
+        _save_prime_state(st)
+        print(f"   >> [PRIME] FLAT | intent={intent.action} | reason={intent.reason}")
+        write_cortex_for_branch(execution_branch)
+        return
+
+    # Cooldown gate (generic)
+    if PRIME_REENTRY_COOLDOWN_H > 0 and last_exit_ts is not None:
+        since_exit_h = (now - last_exit_ts).total_seconds() / 3600.0
+        if since_exit_h < PRIME_REENTRY_COOLDOWN_H:
+            execution_branch = f"REENTRY_COOLDOWN_BLOCK since_exit={since_exit_h:.2f}h < {PRIME_REENTRY_COOLDOWN_H:.2f}h"
+            st["in_position"] = False
+            st["planned_exit_ts"] = None
+            st["peak_equity_usd"] = peak
+            st["last_equity_usd"] = current_equity
+            st["last_decision"] = execution_branch
+            _save_prime_state(st)
+            print(f"   >> [PRIME] HOLD | Reason: REENTRY_COOLDOWN_BLOCK since_exit={since_exit_h:.2f}h < {PRIME_REENTRY_COOLDOWN_H:.2f}h")
+            write_cortex_for_branch(execution_branch)
+            return
+
+    if not wallet_verified:
+        execution_branch = f"WALLET_UNVERIFIED_FAIL_CLOSED_ENTRY err={wallet_err}"
+        print(f"   >> [PRIME] HOLD | Reason: WALLET_UNVERIFIED_FAIL_CLOSED_ENTRY | err={wallet_err}")
+        st["last_decision"] = execution_branch
+        _save_prime_state(st)
+        write_cortex_for_branch(execution_branch)
+        return
+
+    effective_max_exposure = PRIME_MAX_EXPOSURE * dd_expo_mult
+    if effective_max_exposure <= 0:
+        execution_branch = f"BLOCKED_EXPO band={dd_band}"
+        print(f"   >> [PRIME] HOLD | Reason: EXPOSURE_ZERO (dd_band={dd_band})")
+        st["in_position"] = False
+        st["planned_exit_ts"] = None
+        st["peak_equity_usd"] = peak
+        st["last_equity_usd"] = current_equity
+        st["last_decision"] = execution_branch
+        _save_prime_state(st)
+        write_cortex_for_branch(execution_branch)
+        return
+
+    target_usd = equity * effective_max_exposure
+    target_usd = min(target_usd, cash)
+
+    if target_usd < PRIME_MIN_NOTIONAL_USD:
+        execution_branch = "TARGET_TOO_SMALL"
+        print(f"   >> [PRIME] HOLD | Reason: TARGET_BELOW_MIN_NOTIONAL | target=${target_usd:.2f}")
+        st["in_position"] = False
+        st["planned_exit_ts"] = None
+        st["peak_equity_usd"] = peak
+        st["last_equity_usd"] = current_equity
+        st["last_decision"] = execution_branch
+        _save_prime_state(st)
+        write_cortex_for_branch(execution_branch)
+        return
+
+    horizon_h = int(intent.horizon_hours or PRIME_HORIZON_H)
+    new_planned_exit_ts = now + timedelta(hours=horizon_h)
+
+    print(
+        f"   >> [PRIME] ENTER LONG | p={p_long} conf={PRIME_CONF_MIN:.2f} | "
+        f"intent={intent.action} | equity=${equity:.2f} cash=${cash:.2f} dd={dd:.3%} band={dd_band} | "
+        f"effExpo={effective_max_exposure:.3f} target=${target_usd:.2f} px=${price:.2f} | "
+        f"exit_at={new_planned_exit_ts.isoformat()}"
+    )
+
+    qty = _execute_buy(target_usd, price)
+
+    execution_branch = f"ENTER_LONG exec=BUY p={p_long}"
+    st.update(
+        {
+            "killed": False,
+            "peak_equity_usd": peak,
+            "last_equity_usd": equity,
+            "in_position": True,
+            "entry_ts": now.isoformat(),
+            "entry_px": price,
+            "qty_btc": qty,
+            "planned_exit_ts": new_planned_exit_ts.isoformat(),
+            "last_decision": execution_branch,
+        }
+    )
+    _save_prime_state(st)
+
+    write_cortex_for_branch(execution_branch)
+
+
+def _run_legacy_engine(df: pd.DataFrame, model, model_path_str: str) -> None:
+    cycle_start = _utc_ts_str()
+    dry = _is_dry_run()
+    now = _utc_now()
+
+    ctx = StrategyContext(
+        mode="legacy",
+        dry_run=dry,
+        model_file=MODEL_FILE,
+        model_path=model_path_str,
+        now_utc=now,
+    )
+
+    try:
+        external = _load_external_strategy()
+        if external:
+            out = _call_external_strategy(external, df=df, ctx=ctx)
+            if isinstance(out, StrategyIntent):
+                intent = out
+                meta = intent.meta or {}
+            elif isinstance(out, dict):
+                intent = StrategyIntent(**out)
+                meta = intent.meta or {}
+            else:
+                raise TypeError(f"Unsupported external strategy return type: {type(out)}")
+            price = float(df["Close"].iloc[-1])
+        else:
+            strat = LegacyModelStrategy(model)
+            intent, price, meta = strat.get_intent(df, ctx)
+    except Exception as e:
+        print(f"   >> [LEGACY] HOLD | Reason: STRATEGY_INTENT_FAIL | Error: {e}")
+        return
+
+    wallet_verified, cash, btc, equity, wallet_err = _wallet_snapshot(price=price)
+    btc_notional = btc * price
+
+    regime = (meta or {}).get("regime", "UNKNOWN")
+    risk_mult = float((meta or {}).get("risk_mult", 0.0) or 0.0)
+    severity = float((meta or {}).get("severity", 0.0) or 0.0)
+    emergency_exit = bool((meta or {}).get("emergency_exit", False))
+    raw_signal = (meta or {}).get("raw_signal", None)
+
+    _ext_mod = os.getenv("ARGUS_STRATEGY_MODULE", "").strip()
+    _ext_fn = os.getenv("ARGUS_STRATEGY_FUNC", "").strip()
+    _is_external = bool(_ext_mod and _ext_fn)
+    _write_cortex(
+        {
+            "timestamp_utc": cycle_start,
+            "mode": "legacy",
+            "intent_action": intent.action,
+            "intent_reason": intent.reason,
+            "raw_signal": raw_signal,
+            "regime": regime,
+            "risk_mult": float(risk_mult),
+            "severity": float(severity),
+            "emergency_exit": bool(emergency_exit),
+            "wallet_verified": bool(wallet_verified),
+            "wallet_err": wallet_err,
+            "cash_usd": float(cash) if wallet_verified else None,
+            "btc": float(btc) if wallet_verified else None,
+            "btc_notional_usd": float(btc_notional) if wallet_verified else None,
+            "model_file": str(MODEL_FILE),
+            "model_path": str(model_path_str),
+            "dry_run": bool(dry),
+            "external_strategy": _is_external,
+            "external_strategy_module": _ext_mod if _is_external else None,
+            "external_strategy_func": _ext_fn if _is_external else None,
+            "intent_source": "external" if _is_external else "internal",
+        }
+    )
+
+    if intent.action == Action.ENTER_LONG:
         if not wallet_verified:
-            print("   >> [DECISION] HOLD | Reason: WALLET_UNVERIFIED_CANNOT_CONFIRM_POSITION")
+            print("   >> [LEGACY] HOLD | Reason: WALLET_UNVERIFIED_FAIL_CLOSED_BUY")
+            return
+
+        if risk_mult <= 0.0:
+            print(f"   >> [LEGACY] HOLD | Reason: RISK_MULT_ZERO | Regime: {regime}")
+            return
+
+        if btc_notional >= MIN_NOTIONAL_USD:
+            print(f"   >> [LEGACY] HOLD | Reason: ALREADY_IN_POSITION_NO_PYRAMID | BTC_Notional=${btc_notional:.2f}")
+            return
+
+        target_usd = cash * float(risk_mult)
+        if target_usd < MIN_NOTIONAL_USD:
+            print(f"   >> [LEGACY] HOLD | Reason: TARGET_BELOW_MIN_NOTIONAL | Target=${target_usd:.2f}")
+            return
+
+        print(f"   >> [LEGACY] BUY | target=${target_usd:.2f} px=${price:.2f} regime={regime}")
+        _execute_buy(target_usd, price)
+        return
+
+    if intent.action == Action.EXIT_LONG:
+        if not wallet_verified:
+            print("   >> [LEGACY] HOLD | Reason: WALLET_UNVERIFIED_CANNOT_CONFIRM_POSITION")
             return
 
         if btc_notional < MIN_NOTIONAL_USD:
-            print("   >> [DECISION] HOLD | Reason: NO_POSITION_OR_BELOW_MIN_NOTIONAL")
+            print("   >> [LEGACY] HOLD | Reason: NO_POSITION_OR_BELOW_MIN_NOTIONAL")
             return
 
         if emergency_exit:
-            print("   >> [EXECUTION] ROUTE SELL | Reason: EMERGENCY_EXIT_BYPASS_GUARDRAILS")
-            _broker.execute_trade("SELL", btc, price)
+            print("   >> [LEGACY] SELL | Reason: EMERGENCY_EXIT_BYPASS_GUARDRAILS")
+            _execute_sell(btc, price)
             return
 
-        state, state_status = _load_trade_state()
+        state, state_status = _load_trade_state_legacy()
 
-        if state_status == "CORRUPT":
-            print("   >> [EXECUTION] ROUTE SELL | Reason: STATE_CORRUPT_GUARDRAILS_SKIPPED_FAIL_OPEN_SELL")
-            _broker.execute_trade("SELL", btc, price)
-            return
-
-        if state_status == "MISSING":
-            print("   >> [EXECUTION] ROUTE SELL | Reason: STATE_MISSING_GUARDRAILS_SKIPPED_FAIL_OPEN_SELL")
-            _broker.execute_trade("SELL", btc, price)
+        if state_status in ("CORRUPT", "MISSING"):
+            print(f"   >> [LEGACY] SELL | Reason: STATE_{state_status}_FAIL_OPEN_SELL")
+            _execute_sell(btc, price)
             return
 
         entry_time = state["_entry_time"]
         entry_price = float(state["entry_price"])
 
-        now_utc = datetime.now(timezone.utc)
-        hold_time = now_utc - entry_time
-        hold_hours = hold_time.total_seconds() / 3600.0
+        hold_hours = (now - entry_time).total_seconds() / 3600.0
         profit_pct = (price - entry_price) / entry_price
 
         if profit_pct <= -STOP_LOSS_PCT:
-            print(
-                f"   >> [EXECUTION] ROUTE SELL | Reason: STOP_LOSS_TRIGGERED | Loss: {profit_pct:.3%} | "
-                f"Entry: ${entry_price:.2f} | Now: ${price:.2f}"
-            )
-            _broker.execute_trade("SELL", btc, price)
+            print(f"   >> [LEGACY] SELL | Reason: STOP_LOSS_TRIGGERED | pnl={profit_pct:.3%}")
+            _execute_sell(btc, price)
             return
 
         if hold_hours >= MAX_HOLD_HOURS:
-            print(
-                f"   >> [EXECUTION] ROUTE SELL | Reason: MAX_HOLD_EXCEEDED | Held: {hold_hours:.2f}h | "
-                f"Entry: ${entry_price:.2f} | Now: ${price:.2f} | PnL: {profit_pct:.3%}"
-            )
-            _broker.execute_trade("SELL", btc, price)
+            print(f"   >> [LEGACY] SELL | Reason: MAX_HOLD_EXCEEDED | held={hold_hours:.2f}h pnl={profit_pct:.3%}")
+            _execute_sell(btc, price)
             return
 
         if hold_hours < MIN_HOLD_HOURS:
-            print(
-                f"   >> [DECISION] HOLD | Reason: MIN_HOLD_NOT_MET | Held: {hold_hours:.2f}h | "
-                f"Min: {MIN_HOLD_HOURS:.2f}h"
-            )
+            print(f"   >> [LEGACY] HOLD | Reason: MIN_HOLD_NOT_MET | held={hold_hours:.2f}h min={MIN_HOLD_HOURS:.2f}h")
             return
 
         effective_hurdle = PROFIT_HURDLE_PCT
@@ -868,30 +1202,65 @@ def _run_legacy() -> None:
 
         if profit_pct < effective_hurdle:
             print(
-                f"   >> [DECISION] HOLD | Reason: PROFIT_HURDLE_NOT_MET | Profit: {profit_pct:.3%} | "
-                f"HurdleEff: {effective_hurdle:.3%} | BaseHurdle: {PROFIT_HURDLE_PCT:.3%}"
+                f"   >> [LEGACY] HOLD | Reason: PROFIT_HURDLE_NOT_MET | pnl={profit_pct:.3%} hurdle={effective_hurdle:.3%}"
             )
             return
 
-        print(
-            f"   >> [EXECUTION] ROUTE SELL | Profit: {profit_pct:.3%} | "
-            f"Held: {hold_hours:.2f}h | HurdleEff: {effective_hurdle:.3%} | "
-            f"Entry: ${entry_price:.2f} | Now: ${price:.2f}"
-        )
-        _broker.execute_trade("SELL", btc, price)
+        print(f"   >> [LEGACY] SELL | pnl={profit_pct:.3%} held={hold_hours:.2f}h hurdle={effective_hurdle:.3%}")
+        _execute_sell(btc, price)
         return
 
-    print("   >> [DECISION] HOLD | Reason: UNKNOWN_SIGNAL_STATE")
+    print(f"   >> [LEGACY] {intent.action} | reason={intent.reason} | regime={regime}")
 
-# ---------------------------
-# Entry point
-# ---------------------------
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 def generate_signals() -> None:
+    global _PROVENANCE_PRINTED
+
+    if not _PROVENANCE_PRINTED:
+        state_path, _tmp, state_mode = _prime_state_paths()
+        print("   >> [PROVENANCE] signal_generator loaded from:", str(_CURRENT_FILE))
+        print("   >> [PROVENANCE] project_root:", str(_PROJECT_ROOT))
+        print("   >> [PROVENANCE] ARGUS_MODE:", ARGUS_MODE)
+        print("   >> [PROVENANCE] DRY_RUN:", str(_is_dry_run()))
+        print("   >> [PROVENANCE] MODEL_FILE:", str(MODEL_FILE))
+        print("   >> [PROVENANCE] DATA_FILE:", str(DATA_FILE))
+        print("   >> [PROVENANCE] PRIME_STATE_MODE:", state_mode)
+        print("   >> [PROVENANCE] PRIME_STATE_FILE:", str(state_path))
+        if ARGUS_MODE == "prime":
+            print("   >> [PROVENANCE] PRIME_REENTRY_COOLDOWN_H:", PRIME_REENTRY_COOLDOWN_H)
+            print("   >> [PROVENANCE] PRIME_EXIT_MIN_HOLD_H:", PRIME_EXIT_MIN_HOLD_H)
+
+        mod = os.getenv("ARGUS_STRATEGY_MODULE", "").strip()
+        fn = os.getenv("ARGUS_STRATEGY_FUNC", "").strip()
+        if mod and fn:
+            print("   >> [PROVENANCE] EXTERNAL_STRATEGY_MODULE:", mod)
+            print("   >> [PROVENANCE] EXTERNAL_STRATEGY_FUNC:", fn)
+        else:
+            print("   >> [PROVENANCE] EXTERNAL_STRATEGY: (none)")
+
+        _PROVENANCE_PRINTED = True
+
+    update_market_data()
+
+    model, model_path_or_err = _load_model()
+    if model is None:
+        print(f"   >> [DECISION] HOLD | Reason: MODEL_LOAD_FAIL | Error: {model_path_or_err}")
+        return
+
+    df = _load_data()
+    if df is None or df.empty or len(df) < 210:
+        print("   >> [DECISION] HOLD | Reason: INSUFFICIENT_HISTORY_OR_DATA_LOAD_FAIL")
+        return
+
     if ARGUS_MODE == "prime":
-        _run_prime()
+        _run_prime_engine(df, model, model_path_or_err)
     else:
-        _run_legacy()
+        _run_legacy_engine(df, model, model_path_or_err)
+
 
 if __name__ == "__main__":
     generate_signals()

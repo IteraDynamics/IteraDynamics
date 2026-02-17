@@ -1,0 +1,46 @@
+{
+  "inputs": {
+    "trades": "research\\backtests\\results\\regime_trend_v1_trades.csv",
+    "regimes": "output\\regime_classifier_v1_labeled.csv",
+    "label_at": "entry"
+  },
+  "overall": {
+    "n_trades_total": 177,
+    "win_rate_pct_total": 32.7683615819209,
+    "avg_trade_pct_total": 0.005798100996291707,
+    "median_trade_pct_total": -0.0072032225459268,
+    "compounded_return_pct_total": 1.0299828151256296
+  },
+  "by_regime": [
+    {
+      "regime": "TREND_UP",
+      "n_trades": 166,
+      "win_rate_pct": 33.734939759036145,
+      "avg_trade_pct": 0.006514741547942365,
+      "median_trade_pct": -0.00733802694270895,
+      "compounded_return_pct": 1.0857535756516379,
+      "best_trade_pct": 0.208026624791856,
+      "worst_trade_pct": -0.0600927544004573
+    },
+    {
+      "regime": "RANGE",
+      "n_trades": 10,
+      "win_rate_pct": 20.0,
+      "avg_trade_pct": -0.00543126833810131,
+      "median_trade_pct": -0.0070658467788269,
+      "compounded_return_pct": -0.05430166696097638,
+      "best_trade_pct": 0.0103301642192204,
+      "worst_trade_pct": -0.0123251858855939
+    },
+    {
+      "regime": "VOL_EXPANSION",
+      "n_trades": 1,
+      "win_rate_pct": 0.0,
+      "avg_trade_pct": -0.0008705372337876,
+      "median_trade_pct": -0.0008705372337876,
+      "compounded_return_pct": -0.000870537233788049,
+      "best_trade_pct": -0.0008705372337876,
+      "worst_trade_pct": -0.0008705372337876
+    }
+  ]
+}
