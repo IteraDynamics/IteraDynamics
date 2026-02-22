@@ -1,0 +1,75 @@
+name: Portfolio Backtest (Core + Sleeve)
+
+on:
+  workflow_dispatch:
+    inputs:
+      w_core:
+        description: 'Core weight (0-1)'
+        required: false
+        default: '0.7'
+      w_sleeve:
+        description: 'Sleeve weight (0-1)'
+        required: false
+        default: '0.3'
+      fees:
+        description: 'Trading fees (bps, e.g. 6 for 0.06%)'
+        required: false
+        default: '6'
+      slippage:
+        description: 'Slippage (bps, e.g. 5 for 0.05%)'
+        required: false
+        default: '5'
+
+jobs:
+  portfolio-backtest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+      
+      - name: Verify data files exist
+        run: |
+          ls -lh data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
+      
+      - name: Run Portfolio Backtest
+        env:
+          SG_CORE_ENABLE_MACRO_FILTER: "1"
+          SG_CORE_MACRO_EMA_LEN: "2000"
+          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+        run: |
+          python portfolio_backtest.py \
+            --data data/btcusd_3600s_2023-01-01_to_2025-12-30.csv \
+            --core_strategy research.strategies.sg_core_exposure_v2 \
+            --sleeve_strategy research.strategies.sg_mean_reversion_a \
+            --w_core ${{ github.event.inputs.w_core || '0.7' }} \
+            --w_sleeve ${{ github.event.inputs.w_sleeve || '0.3' }} \
+            --fees $(python -c "print(${{ github.event.inputs.fees || '6' }} / 10000)") \
+            --slippage $(python -c "print(${{ github.event.inputs.slippage || '5' }} / 10000)")
+      
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolio-backtest-results
+          path: |
+            combined_curve.csv
+      
+      - name: Display Equity Curve Preview
+        run: |
+          echo "📈 Portfolio Backtest Complete"
+          echo ""
+          echo "First 10 rows of combined equity curve:"
+          head -n 11 combined_curve.csv
+          echo ""
+          echo "Last 10 rows of combined equity curve:"
+          tail -n 10 combined_curve.csv
