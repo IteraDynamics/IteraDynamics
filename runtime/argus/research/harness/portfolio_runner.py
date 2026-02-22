@@ -131,43 +131,43 @@ def compute_portfolio_metrics(
     
     equity_vals = equity_series.values
     
-    # Total return
-    total_return_pct = ((equity_vals[-1] / equity_vals[0]) - 1) * 100
+    # Total return (as decimal, like backtest_runner)
+    total_return = (equity_vals[-1] / equity_vals[0]) - 1
     
     # CAGR
     years = len(equity_vals) / (365.25 * 24)  # Assuming hourly data
-    cagr_pct = ((equity_vals[-1] / equity_vals[0]) ** (1 / years) - 1) * 100
+    cagr = (equity_vals[-1] / equity_vals[0]) ** (1 / years) - 1
     
     # Drawdown
     dd_series = compute_drawdown_series(equity_vals)
-    max_dd_pct = dd_series.min() * 100
+    max_dd = abs(dd_series.min())  # Report as positive, like backtest_runner
     
     # Calmar
-    calmar = compute_calmar(cagr_pct, max_dd_pct)
+    calmar = compute_calmar(cagr, max_dd)
     
     # Sortino
     returns = equity_series.pct_change().dropna().values
     sortino = compute_sortino(returns, risk_free=0.0, ann_factor=8760)
     
     # Weighted average exposure and time in market
-    avg_exposure_pct = (
-        w_core * core_metrics.get("avg_exposure_pct", 0.0)
-        + w_sleeve * sleeve_metrics.get("avg_exposure_pct", 0.0)
+    avg_exposure = (
+        w_core * core_metrics.get("avg_exposure", 0.0)
+        + w_sleeve * sleeve_metrics.get("avg_exposure", 0.0)
     )
     
-    time_in_market_pct = (
-        w_core * core_metrics.get("time_in_market_pct", 0.0)
-        + w_sleeve * sleeve_metrics.get("time_in_market_pct", 0.0)
+    time_in_market = (
+        w_core * core_metrics.get("time_in_market", 0.0)
+        + w_sleeve * sleeve_metrics.get("time_in_market", 0.0)
     )
     
     return {
-        "total_return_pct": total_return_pct,
-        "cagr_pct": cagr_pct,
-        "max_drawdown_pct": max_dd_pct,
+        "total_return": total_return,
+        "cagr": cagr,
+        "max_drawdown": max_dd,
         "calmar": calmar,
         "sortino": sortino,
-        "avg_exposure_pct": avg_exposure_pct,
-        "time_in_market_pct": time_in_market_pct,
+        "avg_exposure": avg_exposure,
+        "time_in_market": time_in_market,
         "final_equity": equity_vals[-1],
         "initial_equity": equity_vals[0],
     }
@@ -245,7 +245,7 @@ def run_portfolio_backtest(
         slippage_bps=slippage_bps,
         closed_only=True,
     )
-    print(f"  ✓ Core CAGR:   {core_metrics['cagr_pct']:.2f}%")
+    print(f"  ✓ Core CAGR:   {core_metrics['cagr']*100:.2f}%")
     print(f"  ✓ Core Calmar: {core_metrics['calmar']:.2f}\n")
     
     # Run Sleeve backtest
@@ -258,13 +258,13 @@ def run_portfolio_backtest(
         slippage_bps=slippage_bps,
         closed_only=True,
     )
-    print(f"  ✓ Sleeve CAGR:   {sleeve_metrics['cagr_pct']:.2f}%")
+    print(f"  ✓ Sleeve CAGR:   {sleeve_metrics['cagr']*100:.2f}%")
     print(f"  ✓ Sleeve Calmar: {sleeve_metrics['calmar']:.2f}\n")
     
     # Combine equity curves
     print("Combining portfolio with static weights...")
-    core_equity_series = core_equity_df.set_index('timestamp')['equity']
-    sleeve_equity_series = sleeve_equity_df.set_index('timestamp')['equity']
+    core_equity_series = core_equity_df.set_index('Timestamp')['equity']
+    sleeve_equity_series = sleeve_equity_df.set_index('Timestamp')['equity']
     
     portfolio_equity_series = combine_equity_curves(
         core_equity_series,
@@ -284,7 +284,7 @@ def run_portfolio_backtest(
     
     # Build portfolio equity DataFrame
     portfolio_equity_df = pd.DataFrame({
-        'timestamp': portfolio_equity_series.index,
+        'Timestamp': portfolio_equity_series.index,
         'equity': portfolio_equity_series.values,
     })
     
@@ -325,13 +325,13 @@ def run_portfolio_backtest(
     print(f"{'='*80}")
     print(f"{'Metric':<25} {'Core':>15} {'Sleeve':>15} {'Portfolio':>15}")
     print(f"{'-'*80}")
-    print(f"{'Total Return %':<25} {core_metrics['total_return_pct']:>14.2f}% {sleeve_metrics['total_return_pct']:>14.2f}% {portfolio_metrics['total_return_pct']:>14.2f}%")
-    print(f"{'CAGR %':<25} {core_metrics['cagr_pct']:>14.2f}% {sleeve_metrics['cagr_pct']:>14.2f}% {portfolio_metrics['cagr_pct']:>14.2f}%")
-    print(f"{'Max Drawdown %':<25} {core_metrics['max_drawdown_pct']:>14.2f}% {sleeve_metrics['max_drawdown_pct']:>14.2f}% {portfolio_metrics['max_drawdown_pct']:>14.2f}%")
+    print(f"{'Total Return %':<25} {core_metrics['total_return']*100:>14.2f}% {sleeve_metrics['total_return']*100:>14.2f}% {portfolio_metrics['total_return']*100:>14.2f}%")
+    print(f"{'CAGR %':<25} {core_metrics['cagr']*100:>14.2f}% {sleeve_metrics['cagr']*100:>14.2f}% {portfolio_metrics['cagr']*100:>14.2f}%")
+    print(f"{'Max Drawdown %':<25} {core_metrics['max_drawdown']*100:>14.2f}% {sleeve_metrics['max_drawdown']*100:>14.2f}% {portfolio_metrics['max_drawdown']*100:>14.2f}%")
     print(f"{'Calmar':<25} {core_metrics['calmar']:>15.2f} {sleeve_metrics['calmar']:>15.2f} {portfolio_metrics['calmar']:>15.2f}")
     print(f"{'Sortino':<25} {core_metrics['sortino']:>15.2f} {sleeve_metrics['sortino']:>15.2f} {portfolio_metrics['sortino']:>15.2f}")
-    print(f"{'Avg Exposure %':<25} {core_metrics['avg_exposure_pct']:>14.2f}% {sleeve_metrics['avg_exposure_pct']:>14.2f}% {portfolio_metrics['avg_exposure_pct']:>14.2f}%")
-    print(f"{'Time in Market %':<25} {core_metrics['time_in_market_pct']:>14.2f}% {sleeve_metrics['time_in_market_pct']:>14.2f}% {portfolio_metrics['time_in_market_pct']:>14.2f}%")
+    print(f"{'Avg Exposure %':<25} {core_metrics['avg_exposure']*100:>14.2f}% {sleeve_metrics['avg_exposure']*100:>14.2f}% {portfolio_metrics['avg_exposure']*100:>14.2f}%")
+    print(f"{'Time in Market %':<25} {core_metrics['time_in_market']*100:>14.2f}% {sleeve_metrics['time_in_market']*100:>14.2f}% {portfolio_metrics['time_in_market']*100:>14.2f}%")
     print(f"{'='*80}\n")
     
     return core_equity_df, sleeve_equity_df, portfolio_equity_df, full_metrics
