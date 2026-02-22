@@ -34,7 +34,7 @@ jobs:
           mkdir -p results
           mkdir -p logs
       
-      - name: Run simple backtests
+      - name: Run bull market backtests (2023-2025)
         run: |
           python3 << 'PYEOF'
           import sys
@@ -160,15 +160,238 @@ jobs:
           
           PYEOF
       
+      - name: Run crash window tests (2021-2022 bear market)
+        run: |
+          python3 << 'PYEOF'
+          import sys
+          import os
+          import pandas as pd
+          import numpy as np
+          import json
+          import csv
+          from datetime import datetime
+          
+          sys.path.insert(0, './runtime/argus')
+          
+          # Import strategies
+          from research.strategies.sg_core_exposure_v2 import generate_intent as core
+          from research.strategies.sg_mean_reversion_a import generate_intent as sleeve2a
+          from research.strategies.sg_mean_reversion_b import generate_intent as sleeve2b
+          from research.strategies.sg_mean_reversion_c import generate_intent as sleeve2c
+          from research.regime import classify_regime
+          
+          # Set environment for Core strategy
+          os.environ['SG_CORE_ENABLE_MACRO_FILTER'] = '1'
+          os.environ['SG_CORE_MACRO_EMA_LEN'] = '2000'
+          os.environ['SG_CORE_MACRO_EXPO_CAP_BEAR'] = '0.00'
+          
+          def crash_window_test(strategy_func, df, name):
+              """Test strategy during crash window"""
+              # Slice crash window: 2021-07-01 to 2022-12-31
+              crash_df = df[(df.index >= '2021-07-01') & (df.index <= '2022-12-31')].copy()
+              
+              if len(crash_df) == 0:
+                  return {'name': name, 'error': 'No data in crash window'}
+              
+              exposures = []
+              peak_equity = 1.0
+              equity = 1.0
+              position = 0.0
+              entry_price = 0.0
+              worst_dd = 0.0
+              
+              full_df_idx = df.index.get_loc(crash_df.index[0])
+              
+              for i, (ts, row) in enumerate(crash_df.iterrows()):
+                  # Get full history up to this point
+                  history_idx = full_df_idx + i
+                  window = df.iloc[:history_idx+1]
+                  px = float(row['Close'])
+                  
+                  try:
+                      intent = strategy_func(window, {}, closed_only=True)
+                      action = intent.get('action', 'HOLD')
+                      
+                      if action == "ENTER_LONG" and position == 0:
+                          position = intent.get('desired_exposure_frac', 0.5)
+                          entry_price = px
+                      elif action == "EXIT_LONG" and position > 0:
+                          pnl = (px / entry_price - 1) * position
+                          equity *= (1 + pnl)
+                          position = 0
+                      
+                      current_expo = position
+                      exposures.append(current_expo)
+                      
+                      # Calculate MTM equity
+                      if position > 0:
+                          mtm_equity = equity * (1 + (px / entry_price - 1) * position)
+                      else:
+                          mtm_equity = equity
+                      
+                      # Track drawdown
+                      if mtm_equity > peak_equity:
+                          peak_equity = mtm_equity
+                      dd = (mtm_equity - peak_equity) / peak_equity
+                      if dd < worst_dd:
+                          worst_dd = dd
+                      
+                  except Exception as e:
+                      exposures.append(0.0)
+              
+              avg_exposure = np.mean(exposures) if exposures else 0.0
+              time_high_exposure = sum(1 for e in exposures if e > 0.5) / len(exposures) if exposures else 0.0
+              
+              return {
+                  'name': name,
+                  'dd_proxy': worst_dd,
+                  'avg_exposure': avg_exposure,
+                  'time_exposure_gt_50pct': time_high_exposure
+              }
+          
+          # Load full dataset (need history before crash window)
+          print("\nLoading full dataset for crash window tests...")
+          df = pd.read_csv('data/btcusd_3600s_2019-01-01_to_2025-12-30.csv')
+          df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+          df = df.set_index('Timestamp')
+          
+          # Run crash tests
+          strategies = [
+              (core, 'Core v2'),
+              (sleeve2a, 'Sleeve 2A (RSI)'),
+              (sleeve2b, 'Sleeve 2B (Bollinger)'),
+              (sleeve2c, 'Sleeve 2C (Hybrid)')
+          ]
+          
+          crash_results = []
+          for strat_func, name in strategies:
+              print(f"\nCrash testing {name}...")
+              result = crash_window_test(strat_func, df, name)
+              crash_results.append(result)
+              if 'error' not in result:
+                  print(f"  DD Proxy: {result['dd_proxy']:.2%}")
+                  print(f"  Avg Exposure: {result['avg_exposure']:.2%}")
+                  print(f"  Time >50% Expo: {result['time_exposure_gt_50pct']:.2%}")
+          
+          # Save crash results
+          with open('results/crash_window.json', 'w') as f:
+              json.dump(crash_results, f, indent=2)
+          
+          # Print crash summary
+          print("\n" + "="*80)
+          print("CRASH WINDOW RESULTS (2021-2022)")
+          print("="*80)
+          print(f"{'Strategy':<25} {'DD Proxy':<12} {'Avg Expo':<12} {'Time>50%':<12}")
+          print("-"*80)
+          for r in crash_results:
+              if 'error' not in r:
+                  print(f"{r['name']:<25} {r['dd_proxy']:>10.2%} {r['avg_exposure']:>10.2%} "
+                        f"{r['time_exposure_gt_50pct']:>10.2%}")
+          
+          PYEOF
+      
+      - name: Apply guardrails and pick winner
+        run: |
+          python3 << 'PYEOF'
+          import json
+          
+          # Load results
+          with open('results/summary.json') as f:
+              bull_results = json.load(f)
+          
+          with open('results/crash_window.json') as f:
+              crash_results = json.load(f)
+          
+          # Match results by name
+          combined = {}
+          for br in bull_results:
+              combined[br['name']] = {'bull': br}
+          for cr in crash_results:
+              if cr['name'] in combined:
+                  combined[cr['name']]['crash'] = cr
+          
+          # Apply guardrails to Sleeve 2 candidates only
+          print("\n" + "="*80)
+          print("GUARDRAIL FILTERING (Sleeve 2 candidates only)")
+          print("="*80)
+          
+          survivors = []
+          for name, data in combined.items():
+              if 'Sleeve' not in name:
+                  continue
+              
+              crash = data.get('crash', {})
+              bull = data.get('bull', {})
+              
+              # Guardrails
+              crash_dd_ok = crash.get('dd_proxy', 0) >= -0.15
+              crash_time_expo_ok = crash.get('time_exposure_gt_50pct', 1) <= 0.02
+              crash_avg_expo_ok = crash.get('avg_exposure', 1) <= 0.15
+              
+              passed = crash_dd_ok and crash_time_expo_ok and crash_avg_expo_ok
+              
+              print(f"\n{name}:")
+              print(f"  Crash DD >= -15%: {crash_dd_ok} ({crash.get('dd_proxy', 0):.2%})")
+              print(f"  Crash Time Expo>50% <= 2%: {crash_time_expo_ok} ({crash.get('time_exposure_gt_50pct', 0):.2%})")
+              print(f"  Crash Avg Expo <= 15%: {crash_avg_expo_ok} ({crash.get('avg_exposure', 0):.2%})")
+              print(f"  → {'✅ PASS' if passed else '❌ FAIL'}")
+              
+              if passed:
+                  survivors.append(name)
+          
+          print(f"\n{'='*80}")
+          print(f"SURVIVORS: {survivors if survivors else 'NONE'}")
+          print(f"{'='*80}\n")
+          
+          # Pick winner
+          if not survivors:
+              print("❌ NO WINNER - All candidates failed guardrails")
+              winner_data = {
+                  'winner': None,
+                  'reason': 'All candidates failed guardrails'
+              }
+          else:
+              # Sort by Calmar (highest first)
+              survivor_data = [(name, combined[name]['bull']) for name in survivors]
+              survivor_data.sort(key=lambda x: x[1]['calmar'], reverse=True)
+              winner_name = survivor_data[0][0]
+              winner = combined[winner_name]['bull']
+              
+              print(f"🏆 WINNER: {winner_name}")
+              print(f"   CAGR: {winner['cagr']:.2f}%")
+              print(f"   Calmar: {winner['calmar']:.2f}")
+              print(f"   Max DD: {winner['max_drawdown']:.2f}%")
+              print(f"   Crash DD: {combined[winner_name]['crash']['dd_proxy']:.2%}")
+              
+              winner_data = {
+                  'winner': winner_name,
+                  'bull_metrics': winner,
+                  'crash_metrics': combined[winner_name]['crash']
+              }
+          
+          # Save winner
+          with open('results/winner.json', 'w') as f:
+              json.dump(winner_data, f, indent=2)
+          
+          PYEOF
+      
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: sleeve2-backtest-results
           path: |
             results/*.json
+            results/*.csv
       
       - name: Display Summary
         run: |
           echo "📊 Backtest Complete"
           echo ""
+          echo "=== Bull Market Results (2023-2025) ==="
           cat results/summary.json
+          echo ""
+          echo "=== Crash Window Results (2021-2022) ==="
+          cat results/crash_window.json
+          echo ""
+          echo "=== Winner ==="
+          cat results/winner.json
