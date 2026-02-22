@@ -1,0 +1,138 @@
+name: Portfolio Confirmation (Core + Sleeve 2A)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/portfolio-confirmation
+
+jobs:
+  portfolio-confirmation:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn requests
+      
+      - name: Cache datasets
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: data/btcusd_*.csv
+          key: btc-data-${{ hashFiles('scripts/data/download_btc_history.py') }}
+      
+      - name: Download BTC datasets
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          
+          # 2023-2025 dataset
+          python scripts/data/download_btc_history.py \
+            --start-date 2023-01-01 \
+            --end-date 2025-12-30 \
+            --outfile data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
+          
+          # 2019-2025 dataset (for crash window and full cycle)
+          python scripts/data/download_btc_history.py \
+            --start-date 2019-01-01 \
+            --end-date 2025-12-30 \
+            --outfile data/btcusd_3600s_2019-01-01_to_2025-12-30.csv
+      
+      - name: Verify datasets
+        run: |
+          ls -lh data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
+          ls -lh data/btcusd_3600s_2019-01-01_to_2025-12-30.csv
+      
+      - name: Test A — Bull Market (2023-2025, 50/50)
+        env:
+          SG_CORE_ENABLE_MACRO_FILTER: "1"
+          SG_CORE_MACRO_EMA_LEN: "2000"
+          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+          ARGUS_DATA_FILE: "data/btcusd_3600s_2023-01-01_to_2025-12-30.csv"
+          ARGUS_LOOKBACK: "200"
+          ARGUS_FEE_BPS: "10"
+          ARGUS_SLIPPAGE_BPS: "5"
+          PORT_CORE_MODULE: "research.strategies.sg_core_exposure_v2"
+          PORT_CORE_FUNC: "generate_intent"
+          PORT_SLEEVE_MODULE: "research.strategies.sg_mean_reversion_a"
+          PORT_SLEEVE_FUNC: "generate_intent"
+          PORT_W_CORE: "0.5"
+          PORT_W_SLEEVE: "0.5"
+        run: |
+          python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.portfolio_runner import main; main()" \
+            --out portfolio_2023_2025
+      
+      - name: Test B — Crash Window (2021-2022, 50/50)
+        env:
+          SG_CORE_ENABLE_MACRO_FILTER: "1"
+          SG_CORE_MACRO_EMA_LEN: "2000"
+          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+          ARGUS_DATA_FILE: "data/btcusd_3600s_2019-01-01_to_2025-12-30.csv"
+          ARGUS_LOOKBACK: "200"
+          ARGUS_FEE_BPS: "10"
+          ARGUS_SLIPPAGE_BPS: "5"
+          PORT_CORE_MODULE: "research.strategies.sg_core_exposure_v2"
+          PORT_CORE_FUNC: "generate_intent"
+          PORT_SLEEVE_MODULE: "research.strategies.sg_mean_reversion_a"
+          PORT_SLEEVE_FUNC: "generate_intent"
+          PORT_W_CORE: "0.5"
+          PORT_W_SLEEVE: "0.5"
+        run: |
+          python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.portfolio_runner import main; main()" \
+            --start 2021-07-01 \
+            --end 2022-12-31 \
+            --out portfolio_crash_2021_2022
+      
+      - name: Test C — Full Cycle (2019-2025, 50/50)
+        env:
+          SG_CORE_ENABLE_MACRO_FILTER: "1"
+          SG_CORE_MACRO_EMA_LEN: "2000"
+          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+          ARGUS_DATA_FILE: "data/btcusd_3600s_2019-01-01_to_2025-12-30.csv"
+          ARGUS_LOOKBACK: "200"
+          ARGUS_FEE_BPS: "10"
+          ARGUS_SLIPPAGE_BPS: "5"
+          PORT_CORE_MODULE: "research.strategies.sg_core_exposure_v2"
+          PORT_CORE_FUNC: "generate_intent"
+          PORT_SLEEVE_MODULE: "research.strategies.sg_mean_reversion_a"
+          PORT_SLEEVE_FUNC: "generate_intent"
+          PORT_W_CORE: "0.5"
+          PORT_W_SLEEVE: "0.5"
+        run: |
+          python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.portfolio_runner import main; main()" \
+            --out portfolio_fullcycle_2019_2025
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolio-confirmation-results
+          path: |
+            portfolio_*_core_equity.csv
+            portfolio_*_sleeve_equity.csv
+            portfolio_*_portfolio_equity.csv
+            portfolio_*_portfolio_metrics.json
+      
+      - name: Display Test Summaries
+        run: |
+          echo "=============================================="
+          echo "PORTFOLIO CONFIRMATION RESULTS"
+          echo "=============================================="
+          echo ""
+          echo "Test A — Bull Market (2023-2025):"
+          cat portfolio_2023_2025_portfolio_metrics.json | python -m json.tool | grep -A 10 '"portfolio"'
+          echo ""
+          echo "Test B — Crash Window (2021-2022):"
+          cat portfolio_crash_2021_2022_portfolio_metrics.json | python -m json.tool | grep -A 10 '"portfolio"'
+          echo ""
+          echo "Test C — Full Cycle (2019-2025):"
+          cat portfolio_fullcycle_2019_2025_portfolio_metrics.json | python -m json.tool | grep -A 10 '"portfolio"'
