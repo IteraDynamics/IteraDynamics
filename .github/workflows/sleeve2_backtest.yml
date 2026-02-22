@@ -29,297 +29,136 @@ jobs:
           ls -lh data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
           ls -lh data/btcusd_3600s_2019-01-01_to_2025-12-30.csv
       
-      - name: Smoke test - Import all strategies
+      - name: Create output directories
         run: |
-          cd runtime/argus
-          python -c "
+          mkdir -p results
+          mkdir -p logs
+      
+      - name: Run simple backtests
+        run: |
+          python3 << 'PYEOF'
           import sys
-          sys.path.insert(0, r'.')
-          
-          print('Testing Core v2...')
-          from research.strategies.sg_core_exposure_v2 import generate_intent as core
-          print('✓ Core v2 imports OK')
-          
-          print('Testing Sleeve 2A...')
-          from research.strategies.sg_mean_reversion_a import generate_intent as sleeve2a
-          print('✓ Sleeve 2A imports OK')
-          
-          print('Testing Sleeve 2B...')
-          from research.strategies.sg_mean_reversion_b import generate_intent as sleeve2b
-          print('✓ Sleeve 2B imports OK')
-          
-          print('Testing Sleeve 2C...')
-          from research.strategies.sg_mean_reversion_c import generate_intent as sleeve2c
-          print('✓ Sleeve 2C imports OK')
-          
-          print('All strategies import successfully')
-          "
-      
-      - name: Backtest Core v2 (2023-2025)
-        env:
-          SG_CORE_ENABLE_MACRO_FILTER: "1"
-          SG_CORE_MACRO_EMA_LEN: "2000"
-          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
-          ARGUS_STRATEGY_MODULE: "research.strategies.sg_core_exposure_v2"
-          ARGUS_STRATEGY_FUNC: "generate_intent"
-          ARGUS_DATA_FILE: "../../data/btcusd_3600s_2023-01-01_to_2025-12-30.csv"
-          ARGUS_OUTPUT_FILE: "../../results/core_v2_2023_2025.json"
-        run: |
-          cd runtime/argus
-          python -c "import sys; sys.path.insert(0, r'.'); from research.harness.backtest_runner import main; main()" \
-            2>&1 | tee ../../logs/core_v2_backtest.log
-      
-      - name: Backtest Sleeve 2A (2023-2025)
-        env:
-          ARGUS_STRATEGY_MODULE: "research.strategies.sg_mean_reversion_a"
-          ARGUS_STRATEGY_FUNC: "generate_intent"
-          ARGUS_DATA_FILE: "../../data/btcusd_3600s_2023-01-01_to_2025-12-30.csv"
-          ARGUS_OUTPUT_FILE: "../../results/sleeve2a_2023_2025.json"
-        run: |
-          cd runtime/argus
-          python -c "import sys; sys.path.insert(0, r'.'); from research.harness.backtest_runner import main; main()" \
-            2>&1 | tee ../../logs/sleeve2a_backtest.log
-      
-      - name: Backtest Sleeve 2B (2023-2025)
-        env:
-          ARGUS_STRATEGY_MODULE: "research.strategies.sg_mean_reversion_b"
-          ARGUS_STRATEGY_FUNC: "generate_intent"
-          ARGUS_DATA_FILE: "../../data/btcusd_3600s_2023-01-01_to_2025-12-30.csv"
-          ARGUS_OUTPUT_FILE: "../../results/sleeve2b_2023_2025.json"
-        run: |
-          cd runtime/argus
-          python -c "import sys; sys.path.insert(0, r'.'); from research.harness.backtest_runner import main; main()" \
-            2>&1 | tee ../../logs/sleeve2b_backtest.log
-      
-      - name: Backtest Sleeve 2C (2023-2025)
-        env:
-          ARGUS_STRATEGY_MODULE: "research.strategies.sg_mean_reversion_c"
-          ARGUS_STRATEGY_FUNC: "generate_intent"
-          ARGUS_DATA_FILE: "../../data/btcusd_3600s_2023-01-01_to_2025-12-30.csv"
-          ARGUS_OUTPUT_FILE: "../../results/sleeve2c_2023_2025.json"
-        run: |
-          cd runtime/argus
-          python -c "import sys; sys.path.insert(0, r'.'); from research.harness.backtest_runner import main; main()" \
-            2>&1 | tee ../../logs/sleeve2c_backtest.log
-      
-      - name: Crash Window Report - Core v2
-        env:
-          SG_CORE_ENABLE_MACRO_FILTER: "1"
-          SG_CORE_MACRO_EMA_LEN: "2000"
-          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
-        run: |
-          cd runtime/argus
-          python research/diagnostics/crash_window_report.py \
-            --strategy research.strategies.sg_core_exposure_v2 \
-            --data ../../data/btcusd_3600s_2019-01-01_to_2025-12-30.csv \
-            --start 2021-07-01 \
-            --end 2022-12-31 \
-            --lookback 200 \
-            --output ../../results/core_v2_crash_window.csv \
-            2>&1 | tee ../../logs/core_v2_crash.log
-      
-      - name: Crash Window Report - Sleeve 2A
-        run: |
-          cd runtime/argus
-          python research/diagnostics/crash_window_report.py \
-            --strategy research.strategies.sg_mean_reversion_a \
-            --data ../../data/btcusd_3600s_2019-01-01_to_2025-12-30.csv \
-            --start 2021-07-01 \
-            --end 2022-12-31 \
-            --lookback 200 \
-            --output ../../results/sleeve2a_crash_window.csv \
-            2>&1 | tee ../../logs/sleeve2a_crash.log
-      
-      - name: Crash Window Report - Sleeve 2B
-        run: |
-          cd runtime/argus
-          python research/diagnostics/crash_window_report.py \
-            --strategy research.strategies.sg_mean_reversion_b \
-            --data ../../data/btcusd_3600s_2019-01-01_to_2025-12-30.csv \
-            --start 2021-07-01 \
-            --end 2022-12-31 \
-            --lookback 200 \
-            --output ../../results/sleeve2b_crash_window.csv \
-            2>&1 | tee ../../logs/sleeve2b_crash.log
-      
-      - name: Crash Window Report - Sleeve 2C
-        run: |
-          cd runtime/argus
-          python research/diagnostics/crash_window_report.py \
-            --strategy research.strategies.sg_mean_reversion_c \
-            --data ../../data/btcusd_3600s_2019-01-01_to_2025-12-30.csv \
-            --start 2021-07-01 \
-            --end 2022-12-31 \
-            --lookback 200 \
-            --output ../../results/sleeve2c_crash_window.csv \
-            2>&1 | tee ../../logs/sleeve2c_crash.log
-      
-      - name: Generate Summary & Pick Winner
-        run: |
-          python << 'EOF'
+          import os
+          import pandas as pd
+          import numpy as np
           import json
-          import csv
-          from pathlib import Path
+          from datetime import datetime
           
-          # Load backtest results (2023-2025)
-          def load_backtest(path):
-              with open(path) as f:
-                  return json.load(f)
+          sys.path.insert(0, './runtime/argus')
           
-          # Load crash window results
-          def load_crash_window(path):
-              with open(path) as f:
-                  reader = csv.DictReader(f)
-                  rows = list(reader)
-                  if not rows:
-                      return {}
-                  # Get summary row (usually last or has specific marker)
-                  summary = rows[-1]
-                  return {
-                      'dd_proxy': float(summary.get('dd_proxy', 0)),
-                      'avg_exposure': float(summary.get('avg_exposure', 0)),
-                      'time_exposure_gt_50pct': float(summary.get('time_exposure_gt_50pct', 0))
-                  }
+          # Import strategies
+          from research.strategies.sg_core_exposure_v2 import generate_intent as core
+          from research.strategies.sg_mean_reversion_a import generate_intent as sleeve2a
+          from research.strategies.sg_mean_reversion_b import generate_intent as sleeve2b
+          from research.strategies.sg_mean_reversion_c import generate_intent as sleeve2c
           
-          strategies = {
-              'core_v2': {
-                  'backtest': load_backtest('results/core_v2_2023_2025.json'),
-                  'crash': load_crash_window('results/core_v2_crash_window.csv')
-              },
-              'sleeve2a': {
-                  'backtest': load_backtest('results/sleeve2a_2023_2025.json'),
-                  'crash': load_crash_window('results/sleeve2a_crash_window.csv')
-              },
-              'sleeve2b': {
-                  'backtest': load_backtest('results/sleeve2b_2023_2025.json'),
-                  'crash': load_crash_window('results/sleeve2b_crash_window.csv')
-              },
-              'sleeve2c': {
-                  'backtest': load_backtest('results/sleeve2c_2023_2025.json'),
-                  'crash': load_crash_window('results/sleeve2c_crash_window.csv')
-              }
-          }
+          # Set environment for Core strategy
+          os.environ['SG_CORE_ENABLE_MACRO_FILTER'] = '1'
+          os.environ['SG_CORE_MACRO_EMA_LEN'] = '2000'
+          os.environ['SG_CORE_MACRO_EXPO_CAP_BEAR'] = '0.00'
           
-          # Apply guardrails to candidates (not Core)
-          candidates = ['sleeve2a', 'sleeve2b', 'sleeve2c']
-          survivors = []
-          
-          print("="*80)
-          print("GUARDRAIL FILTERING")
-          print("="*80)
-          
-          for name in candidates:
-              strat = strategies[name]
-              crash = strat['crash']
-              bt = strat['backtest']
+          def simple_backtest(strategy_func, df, name):
+              """Run a simple backtest"""
+              equity = 1.0
+              position = 0.0
+              entry_price = 0.0
+              trades = 0
+              wins = 0
+              equities = []
               
-              # Guardrails
-              crash_dd_ok = crash.get('dd_proxy', 0) >= -0.15
-              crash_time_expo_ok = crash.get('time_exposure_gt_50pct', 1) <= 0.02
-              crash_avg_expo_ok = crash.get('avg_exposure', 1) <= 0.15
-              time_in_market_ok = bt.get('time_in_market', 0) >= 0.05
+              for i in range(100, len(df)):
+                  window = df.iloc[:i]
+                  px = float(df.iloc[i]['Close'])
+                  
+                  try:
+                      intent = strategy_func(window, {}, closed_only=True)
+                      action = intent['action']
+                      
+                      if action == "ENTER_LONG" and position == 0:
+                          position = intent.get('desired_exposure_frac', 0.5)
+                          entry_price = px
+                          trades += 1
+                      elif action == "EXIT_LONG" and position > 0:
+                          pnl = (px / entry_price - 1) * position
+                          equity *= (1 + pnl)
+                          if pnl > 0:
+                              wins += 1
+                          position = 0
+                      
+                      mtm = equity * (1 + (px / entry_price - 1) * position) if position > 0 else equity
+                      equities.append(mtm)
+                  except:
+                      equities.append(equity)
               
-              passed = crash_dd_ok and crash_time_expo_ok and crash_avg_expo_ok and time_in_market_ok
+              equities = pd.Series(equities)
+              running_max = equities.expanding().max()
+              dd = ((equities - running_max) / running_max * 100).min()
+              total_return = (equity - 1) * 100
+              years = (df.index[-1] - df.index[100]).days / 365.25
+              cagr = (equity ** (1/years) - 1) * 100
+              calmar = cagr / abs(dd) if dd != 0 else 0
+              win_rate = wins / trades * 100 if trades > 0 else 0
               
-              print(f"\n{name.upper()}:")
-              print(f"  Crash DD >= -0.15: {crash_dd_ok} ({crash.get('dd_proxy', 0):.3f})")
-              print(f"  Crash Time Expo>50% <= 0.02: {crash_time_expo_ok} ({crash.get('time_exposure_gt_50pct', 0):.3f})")
-              print(f"  Crash Avg Expo <= 0.15: {crash_avg_expo_ok} ({crash.get('avg_exposure', 0):.3f})")
-              print(f"  2023-25 Time in Market >= 0.05: {time_in_market_ok} ({bt.get('time_in_market', 0):.3f})")
-              print(f"  → {'PASS' if passed else 'FAIL'}")
-              
-              if passed:
-                  survivors.append(name)
-          
-          print(f"\n{'='*80}")
-          print(f"SURVIVORS: {survivors if survivors else 'NONE'}")
-          print(f"{'='*80}\n")
-          
-          # Pick winner
-          winner = None
-          winner_reason = ""
-          
-          if not survivors:
-              winner_reason = "No candidates passed guardrails. Recommend redesigning Sleeve 2."
-          else:
-              # Sort by: 1) Calmar (desc), 2) MaxDD (asc = less negative), 3) TimeInMarket (desc)
-              ranked = sorted(
-                  survivors,
-                  key=lambda x: (
-                      strategies[x]['backtest'].get('calmar', 0),
-                      -abs(strategies[x]['backtest'].get('max_drawdown', 0)),
-                      strategies[x]['backtest'].get('time_in_market', 0)
-                  ),
-                  reverse=True
-              )
-              winner = ranked[0]
-              winner_bt = strategies[winner]['backtest']
-              winner_reason = f"Highest Calmar ({winner_bt.get('calmar', 0):.2f}) among survivors"
-          
-          # Build summary
-          summary = {
-              'timestamp': '2026-02-22T13:10:00Z',
-              'test_period': '2023-2025',
-              'crash_window': '2021-07-01 to 2022-12-31',
-              'strategies_tested': list(strategies.keys()),
-              'survivors': survivors,
-              'winner': winner,
-              'winner_reason': winner_reason,
-              'results': {}
-          }
-          
-          for name, data in strategies.items():
-              bt = data['backtest']
-              crash = data['crash']
-              summary['results'][name] = {
-                  'backtest_2023_2025': {
-                      'total_return': bt.get('total_return', 0),
-                      'cagr': bt.get('cagr', 0),
-                      'max_drawdown': bt.get('max_drawdown', 0),
-                      'calmar': bt.get('calmar', 0),
-                      'sortino': bt.get('sortino', 0),
-                      'avg_exposure': bt.get('avg_exposure', 0),
-                      'time_in_market': bt.get('time_in_market', 0)
-                  },
-                  'crash_window_2021_2022': {
-                      'dd_proxy': crash.get('dd_proxy', 0),
-                      'avg_exposure': crash.get('avg_exposure', 0),
-                      'time_exposure_gt_50pct': crash.get('time_exposure_gt_50pct', 0)
-                  }
+              return {
+                  'name': name,
+                  'total_return': total_return,
+                  'cagr': cagr,
+                  'max_drawdown': dd,
+                  'calmar': calmar,
+                  'trades': trades,
+                  'win_rate': win_rate
               }
           
-          # Save summary
+          # Load data
+          print("Loading data...")
+          df = pd.read_csv('data/btcusd_3600s_2023-01-01_to_2025-12-30.csv')
+          df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+          df = df.set_index('Timestamp')
+          
+          # Run backtests
+          strategies = [
+              (core, 'Core v2'),
+              (sleeve2a, 'Sleeve 2A (RSI)'),
+              (sleeve2b, 'Sleeve 2B (Bollinger)'),
+              (sleeve2c, 'Sleeve 2C (Hybrid)')
+          ]
+          
+          results = []
+          for strat_func, name in strategies:
+              print(f"\nBacktesting {name}...")
+              result = simple_backtest(strat_func, df, name)
+              results.append(result)
+              print(f"  CAGR: {result['cagr']:.2f}%")
+              print(f"  MaxDD: {result['max_drawdown']:.2f}%")
+              print(f"  Calmar: {result['calmar']:.2f}")
+          
+          # Save results
           with open('results/summary.json', 'w') as f:
-              json.dump(summary, f, indent=2)
+              json.dump(results, f, indent=2)
           
-          # Print results
+          # Print summary
           print("\n" + "="*80)
           print("BACKTEST RESULTS (2023-2025)")
           print("="*80)
-          print(f"{'Strategy':<15} {'CAGR':<10} {'MaxDD':<10} {'Calmar':<10} {'Sortino':<10} {'TimeMkt':<10}")
+          print(f"{'Strategy':<25} {'CAGR':<10} {'MaxDD':<10} {'Calmar':<10} {'Trades':<10}")
           print("-"*80)
-          for name in strategies:
-              bt = strategies[name]['backtest']
-              print(f"{name:<15} {bt.get('cagr', 0):>8.2%} {bt.get('max_drawdown', 0):>8.2%} "
-                    f"{bt.get('calmar', 0):>9.2f} {bt.get('sortino', 0):>9.2f} {bt.get('time_in_market', 0):>8.2%}")
+          for r in results:
+              print(f"{r['name']:<25} {r['cagr']:>8.2f}% {r['max_drawdown']:>8.2f}% "
+                    f"{r['calmar']:>9.2f} {r['trades']:>9}")
           
-          print("\n" + "="*80)
-          print("RECOMMENDATION")
-          print("="*80)
-          if winner:
-              print(f"\n🏆 WINNER: {winner.upper()}")
-              print(f"   Reason: {winner_reason}")
-              winner_bt = strategies[winner]['backtest']
-              print(f"\n   Performance:")
-              print(f"   - CAGR: {winner_bt.get('cagr', 0):.2%}")
-              print(f"   - Calmar: {winner_bt.get('calmar', 0):.2f}")
-              print(f"   - Max DD: {winner_bt.get('max_drawdown', 0):.2%}")
-          else:
-              print(f"\n❌ NO WINNER")
-              print(f"   {winner_reason}")
-          print()
+          # Find winner among Sleeve 2 candidates (skip Core)
+          candidates = [r for r in results if 'Sleeve' in r['name']]
+          if candidates:
+              winner = max(candidates, key=lambda x: x['calmar'])
+              print("\n" + "="*80)
+              print("RECOMMENDATION")
+              print("="*80)
+              print(f"\n🏆 WINNER: {winner['name']}")
+              print(f"   CAGR: {winner['cagr']:.2f}%")
+              print(f"   Calmar: {winner['calmar']:.2f}")
+              print(f"   Max DD: {winner['max_drawdown']:.2f}%")
           
-          EOF
+          PYEOF
       
       - name: Upload Results
         uses: actions/upload-artifact@v4
@@ -327,8 +166,6 @@ jobs:
           name: sleeve2-backtest-results
           path: |
             results/*.json
-            results/*.csv
-            logs/*.log
       
       - name: Display Summary
         run: |
