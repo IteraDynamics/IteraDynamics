@@ -42,7 +42,7 @@ jobs:
             --end-date 2025-12-30 \
             --outfile data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
           
-          # 2019-2025 dataset (for crash window and full cycle)
+          # 2019-2025 dataset
           python scripts/data/download_btc_history.py \
             --start-date 2019-01-01 \
             --end-date 2025-12-30 \
@@ -53,61 +53,85 @@ jobs:
           ls -lh data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
           ls -lh data/btcusd_3600s_2019-01-01_to_2025-12-30.csv
       
+      # -------------------------------
+      # TEST A — 2023–2025
+      # -------------------------------
       - name: Test A — Bull Market (2023-2025, 50/50)
         env:
+          # --- CORE CONFIG (EXPLICIT) ---
           SG_CORE_ENABLE_MACRO_FILTER: "1"
           SG_CORE_MACRO_EMA_LEN: "2000"
-          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+          SG_CORE_CAP_BULL: "1.00"
+          SG_CORE_CAP_BEAR: "0.00"
+
+          # --- DATA / EXECUTION ---
           ARGUS_DATA_FILE: "data/btcusd_3600s_2023-01-01_to_2025-12-30.csv"
           ARGUS_LOOKBACK: "200"
           ARGUS_FEE_BPS: "10"
           ARGUS_SLIPPAGE_BPS: "5"
+
+          # --- PORTFOLIO ---
           PORT_CORE_MODULE: "research.strategies.sg_core_exposure_v2"
           PORT_CORE_FUNC: "generate_intent"
           PORT_SLEEVE_MODULE: "research.strategies.sg_mean_reversion_a"
           PORT_SLEEVE_FUNC: "generate_intent"
           PORT_W_CORE: "0.5"
           PORT_W_SLEEVE: "0.5"
+
         run: |
           python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.portfolio_runner import main; main()" \
             --out portfolio_2023_2025
       
+      # -------------------------------
+      # TEST B — 2021–2022 Crash
+      # -------------------------------
       - name: Test B — Crash Window (2021-2022, 50/50)
         env:
           SG_CORE_ENABLE_MACRO_FILTER: "1"
           SG_CORE_MACRO_EMA_LEN: "2000"
-          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+          SG_CORE_CAP_BULL: "1.00"
+          SG_CORE_CAP_BEAR: "0.00"
+
           ARGUS_DATA_FILE: "data/btcusd_3600s_2019-01-01_to_2025-12-30.csv"
           ARGUS_LOOKBACK: "200"
           ARGUS_FEE_BPS: "10"
           ARGUS_SLIPPAGE_BPS: "5"
+
           PORT_CORE_MODULE: "research.strategies.sg_core_exposure_v2"
           PORT_CORE_FUNC: "generate_intent"
           PORT_SLEEVE_MODULE: "research.strategies.sg_mean_reversion_a"
           PORT_SLEEVE_FUNC: "generate_intent"
           PORT_W_CORE: "0.5"
           PORT_W_SLEEVE: "0.5"
+
         run: |
           python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.portfolio_runner import main; main()" \
             --start 2021-07-01 \
             --end 2022-12-31 \
             --out portfolio_crash_2021_2022
       
+      # -------------------------------
+      # TEST C — Full Cycle
+      # -------------------------------
       - name: Test C — Full Cycle (2019-2025, 50/50)
         env:
           SG_CORE_ENABLE_MACRO_FILTER: "1"
           SG_CORE_MACRO_EMA_LEN: "2000"
-          SG_CORE_MACRO_EXPO_CAP_BEAR: "0.00"
+          SG_CORE_CAP_BULL: "1.00"
+          SG_CORE_CAP_BEAR: "0.00"
+
           ARGUS_DATA_FILE: "data/btcusd_3600s_2019-01-01_to_2025-12-30.csv"
           ARGUS_LOOKBACK: "200"
           ARGUS_FEE_BPS: "10"
           ARGUS_SLIPPAGE_BPS: "5"
+
           PORT_CORE_MODULE: "research.strategies.sg_core_exposure_v2"
           PORT_CORE_FUNC: "generate_intent"
           PORT_SLEEVE_MODULE: "research.strategies.sg_mean_reversion_a"
           PORT_SLEEVE_FUNC: "generate_intent"
           PORT_W_CORE: "0.5"
           PORT_W_SLEEVE: "0.5"
+
         run: |
           python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.portfolio_runner import main; main()" \
             --out portfolio_fullcycle_2019_2025
