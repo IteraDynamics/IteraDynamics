@@ -22,7 +22,7 @@ Constraints honored:
 Design change (only TREND_UP behavior):
 - When macro filter enabled:
     macro_bull = price > EMA_macro AND slope(EMA_macro) > 0
-    If macro_bull: allow v1 full exposure scaling
+    If macro_bull: cap exposure to ENV_MACRO_EXPO_CAP_BULL (default 1.00)
     Else: cap exposure to ENV_MACRO_EXPO_CAP_BEAR (default 0.25)
 - When macro filter disabled:
     TREND_UP behavior reverts to v1 logic (no additional gating, no macro meta emitted)
@@ -70,6 +70,7 @@ ENV_TREND_STRENGTH_STRONG = "SG_CORE_TREND_STRENGTH_STRONG"   # default 0.60
 ENV_ENABLE_MACRO_FILTER = "SG_CORE_ENABLE_MACRO_FILTER"       # default 1
 ENV_MACRO_EMA_LEN = "SG_CORE_MACRO_EMA_LEN"                   # default 200
 ENV_MACRO_EXPO_CAP_BEAR = "SG_CORE_MACRO_EXPO_CAP_BEAR"       # default 0.25
+ENV_MACRO_EXPO_CAP_BULL = "SG_CORE_MACRO_EXPO_CAP_BULL"       # default 1.00
 ENV_MACRO_SLOPE_LAG = "SG_CORE_MACRO_SLOPE_LAG"               # default 1 (slope = ema[t] - ema[t-1])
 
 
@@ -282,6 +283,7 @@ def generate_intent(df: pd.DataFrame, ctx: Dict[str, Any], *, closed_only: bool 
     enable_macro = _get_env_bool01(ENV_ENABLE_MACRO_FILTER, 1)
     macro_len = _get_env_int(ENV_MACRO_EMA_LEN, 200)
     macro_expo_cap_bear = _get_env_float(ENV_MACRO_EXPO_CAP_BEAR, 0.25)
+    macro_expo_cap_bull = _get_env_float(ENV_MACRO_EXPO_CAP_BULL, 1.00)
     macro_slope_lag = _get_env_int(ENV_MACRO_SLOPE_LAG, 1)
 
     # Layer 1 regime classification (authoritative)
@@ -563,14 +565,15 @@ def generate_intent(df: pd.DataFrame, ctx: Dict[str, Any], *, closed_only: bool 
         meta2 = {**meta, "macro": macro}
 
         if macro_bull:
-            # Macro bull: allow full v1 exposure scaling
+            # Macro bull: cap exposure to macro_expo_cap_bull
+            expo_bull = _clamp(expo_v1, 0.0, float(macro_expo_cap_bull))
             return _action_dict(
-                action="ENTER_LONG" if expo_v1 > 0 else "HOLD",
+                action="ENTER_LONG" if expo_bull > 0 else "HOLD",
                 confidence=confidence_v1,
-                desired_exposure_frac=expo_v1,
+                desired_exposure_frac=expo_bull,
                 horizon_hours=horizon_hours,
-                reason=f"trend_up_vol_scaled_exposure(bucket={ts_bucket})",
-                meta={**meta2, "exposure": {"expo_raw": expo_raw_v1, "expo_clamped": expo_v1}},
+                reason=f"trend_up_macro_bull_capped(bucket={ts_bucket}, cap={macro_expo_cap_bull})",
+                meta={**meta2, "exposure": {"expo_raw": expo_raw_v1, "expo_v1": expo_v1, "expo_capped": expo_bull}},
             )
 
         # Macro bear: cap exposure ceiling (do NOT override exit logic)
