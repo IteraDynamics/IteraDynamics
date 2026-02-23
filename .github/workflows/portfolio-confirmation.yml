@@ -22,7 +22,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn requests
+          pip install pandas numpy scikit-learn requests pandas-ta
+          
+          echo "=============================================="
+          echo "Installed package versions:"
+          pip list | grep -E "pandas|numpy|scikit|pandas-ta"
+          echo "=============================================="
 
       - name: Cache datasets
         id: cache-data
@@ -52,6 +57,19 @@ jobs:
         run: |
           ls -lh data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
           ls -lh data/btcusd_3600s_2019-01-01_to_2025-12-30.csv
+          
+          echo "=============================================="
+          echo "CSV Schema Check (2023-2025 dataset)"
+          echo "=============================================="
+          echo "Header:"
+          head -n 1 data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
+          echo ""
+          echo "First 3 data rows:"
+          head -n 4 data/btcusd_3600s_2023-01-01_to_2025-12-30.csv | tail -n 3
+          echo ""
+          echo "Last 3 data rows:"
+          tail -n 3 data/btcusd_3600s_2023-01-01_to_2025-12-30.csv
+          echo "=============================================="
 
       # -----------------------
       # Test A — 2023-2025
@@ -78,7 +96,31 @@ jobs:
           PORT_W_SLEEVE: "0.5"
         run: |
           python runtime/argus/research/harness/portfolio_runner.py \
-            --out portfolio_2023_2025
+            --out portfolio_2023_2025 2>&1 | tee test_a.log
+      
+      - name: Diagnose Test A — Check for regime failures
+        run: |
+          echo "=============================================="
+          echo "DIAGNOSTIC: Test A Regime Failure Check"
+          echo "=============================================="
+          if grep -q "missing_regime_state_fail_closed" test_a.log; then
+            echo "❌ FOUND: Core is failing closed due to missing regime state!"
+            echo "This means classify_regime() is throwing an exception."
+            grep -i "error\|exception\|failed" test_a.log || echo "No explicit error messages in log"
+          else
+            echo "✅ No 'missing_regime_state_fail_closed' found - regime classification working"
+          fi
+          echo ""
+          echo "Core equity check:"
+          if [ -f portfolio_2023_2025_core_equity.csv ]; then
+            echo "First 5 rows of Core equity:"
+            head -n 6 portfolio_2023_2025_core_equity.csv
+            echo "Last 3 rows of Core equity:"
+            tail -n 3 portfolio_2023_2025_core_equity.csv
+          else
+            echo "❌ Core equity CSV not found!"
+          fi
+          echo "=============================================="
 
       # -----------------------
       # Test B — Crash window
