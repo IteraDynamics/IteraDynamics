@@ -141,7 +141,11 @@ def test_broker_connection() -> TestResult:
         result.passed = True
         result.message = "RealBroker initialized successfully"
         result.details["mode"] = "DRY-RUN" if broker.dry_run else "LIVE"
-        result.details["product"] = "BTC-USD"
+        try:
+            from config import PRODUCT_ID
+        except ImportError:
+            PRODUCT_ID = os.getenv("ARGUS_PRODUCT_ID", "BTC-USD")
+        result.details["product"] = PRODUCT_ID
 
     except Exception as e:
         result.passed = False
@@ -184,7 +188,11 @@ def test_market_data() -> TestResult:
 
     try:
         import requests
-        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+        try:
+            from config import PRODUCT_ID
+        except ImportError:
+            PRODUCT_ID = os.getenv("ARGUS_PRODUCT_ID", "BTC-USD")
+        url = f"https://api.coinbase.com/v2/prices/{PRODUCT_ID}/spot"
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
@@ -209,7 +217,11 @@ def test_candle_fetch() -> TestResult:
 
     try:
         import requests
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+        try:
+            from config import PRODUCT_ID
+        except ImportError:
+            PRODUCT_ID = os.getenv("ARGUS_PRODUCT_ID", "BTC-USD")
+        url = f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/candles"
         resp = requests.get(url, params={"granularity": 3600}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -219,6 +231,7 @@ def test_candle_fetch() -> TestResult:
 
         result.passed = True
         result.message = f"Retrieved {len(data)} hourly candles"
+        result.details["product"] = PRODUCT_ID
         result.details["latest_close"] = f"${data[0][4]:,.2f}" if data else "N/A"
 
     except Exception as e:
@@ -432,6 +445,49 @@ def test_state_files() -> TestResult:
     return result
 
 
+def test_multi_product_paths() -> TestResult:
+    """Verify config uses legacy names for BTC-USD and namespaced names for ETH-USD."""
+    result = TestResult("Multi-Product Path Namespacing")
+    start = time.time()
+
+    try:
+        from config import (
+            PRODUCT_ID, PRODUCT_SLUG,
+            FLIGHT_RECORDER_PATH, TRADE_STATE_PATH, LOG_PATH,
+        )
+        # Default (current env): expect legacy if BTC-USD, namespaced otherwise
+        if PRODUCT_SLUG == "btc_usd":
+            if FLIGHT_RECORDER_PATH.name != "flight_recorder.csv":
+                result.passed = False
+                result.message = f"BTC-USD should use legacy path, got {FLIGHT_RECORDER_PATH.name}"
+                result.details["path"] = str(FLIGHT_RECORDER_PATH)
+                result.duration_ms = int((time.time() - start) * 1000)
+                return result
+            result.passed = True
+            result.message = "BTC-USD: legacy filenames (flight_recorder.csv, etc.)"
+            result.details["product"] = PRODUCT_ID
+            result.details["flight_recorder"] = FLIGHT_RECORDER_PATH.name
+        else:
+            if PRODUCT_SLUG not in FLIGHT_RECORDER_PATH.name or "flight_recorder_" not in FLIGHT_RECORDER_PATH.name:
+                result.passed = False
+                result.message = f"Non-BTC product should use namespaced path, got {FLIGHT_RECORDER_PATH.name}"
+                result.details["product"] = PRODUCT_ID
+                result.details["path"] = str(FLIGHT_RECORDER_PATH)
+                result.duration_ms = int((time.time() - start) * 1000)
+                return result
+            result.passed = True
+            result.message = f"{PRODUCT_ID}: namespaced filenames (slug={PRODUCT_SLUG})"
+            result.details["product"] = PRODUCT_ID
+            result.details["flight_recorder"] = FLIGHT_RECORDER_PATH.name
+            result.details["log"] = LOG_PATH.name
+    except Exception as e:
+        result.passed = False
+        result.message = f"Error: {e}"
+
+    result.duration_ms = int((time.time() - start) * 1000)
+    return result
+
+
 # ---------------------------
 # Full Cycle Simulation
 # ---------------------------
@@ -541,6 +597,7 @@ def run_all_tests():
         ("Candles", test_candle_fetch),
         ("Signal Import", test_signal_generator_import),
         ("State Files", test_state_files),
+        ("Multi-Product Paths", test_multi_product_paths),
         ("Dry-Run BUY", test_dry_run_buy),
         ("Dry-Run SELL", test_dry_run_sell),
         ("Exit Watcher", test_exit_watcher),

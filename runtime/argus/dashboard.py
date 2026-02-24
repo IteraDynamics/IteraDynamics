@@ -103,6 +103,26 @@ if RealBroker is None:
     except Exception as e2:
         broker_import_err = f"{broker_import_err}; fallback also failed: {e2}"
 
+# Product and namespaced paths (ARGUS_PRODUCT_ID)
+try:
+    from config import (
+        PRODUCT_ID,
+        FLIGHT_RECORDER_PATH,
+        PRIME_STATE_LIVE_PATH,
+        PRIME_STATE_PAPER_PATH,
+        TRADE_STATE_PATH,
+        CORTEX_PATH,
+        LOG_PATH,
+    )
+except ImportError:
+    PRODUCT_ID = os.getenv("ARGUS_PRODUCT_ID", "BTC-USD")
+    FLIGHT_RECORDER_PATH = project_root / "flight_recorder.csv"
+    PRIME_STATE_LIVE_PATH = project_root / "prime_state.json"
+    PRIME_STATE_PAPER_PATH = project_root / "paper_prime_state.json"
+    TRADE_STATE_PATH = project_root / "trade_state.json"
+    CORTEX_PATH = project_root / "cortex.json"
+    LOG_PATH = project_root / "argus.log"
+
 if RealBroker is None:
     st.error(
         "❌ Could not import RealBroker.\n\n"
@@ -243,7 +263,7 @@ def get_live_price() -> float:
     Cached 5s to reduce API hits.
     """
     try:
-        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+        url = f"https://api.coinbase.com/v2/prices/{PRODUCT_ID}/spot"
         resp = requests.get(url, timeout=3)
         return float(resp.json()["data"]["amount"])
     except Exception:
@@ -273,7 +293,7 @@ def _load_market_data_cached(_mtime: float, path_str: str) -> pd.DataFrame:
 
 
 def load_market_data() -> pd.DataFrame:
-    csv_path = project_root / "flight_recorder.csv"
+    csv_path = FLIGHT_RECORDER_PATH
     try:
         mtime = os.path.getmtime(str(csv_path)) if csv_path.exists() else 0.0
     except Exception:
@@ -293,7 +313,7 @@ def _safe_read_tail(path: Path, n_lines: int = 300) -> str:
 
 
 def read_logs() -> str:
-    log_path = project_root / "argus.log"
+    log_path = LOG_PATH
     txt = _safe_read_tail(log_path, n_lines=300)
     return txt if txt else "Waiting for logs..."
 
@@ -362,7 +382,7 @@ def _human_td(seconds: float) -> str:
 
 
 def get_cortex_state() -> dict:
-    cortex_path = project_root / "cortex.json"
+    cortex_path = CORTEX_PATH
 
     state = {
         "timestamp_utc": None,
@@ -436,8 +456,8 @@ def get_cortex_state() -> dict:
 
 
 def get_prime_state() -> dict | None:
-    paper = project_root / "paper_prime_state.json"
-    live = project_root / "prime_state.json"
+    paper = PRIME_STATE_PAPER_PATH
+    live = PRIME_STATE_LIVE_PATH
 
     dry = _env_bool("ARGUS_DRY_RUN", default=False) or _env_bool("PRIME_DRY_RUN", default=False)
 
@@ -451,7 +471,7 @@ def get_prime_state() -> dict | None:
 
 
 def get_auto_entry_legacy() -> float:
-    path = project_root / "trade_state.json"
+    path = TRADE_STATE_PATH
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -676,7 +696,7 @@ def main():
                     y=df["Close"],
                     mode="lines",
                     line=dict(color="#00ff00", width=2),
-                    name="BTC-USD",
+                    name=PRODUCT_ID,
                 )
             )
 
@@ -698,7 +718,7 @@ def main():
             )
             st.plotly_chart(fig, width="stretch")
         else:
-            st.markdown("<div class='subtle'>No market data found (flight_recorder.csv missing).</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='subtle'>No market data found ({FLIGHT_RECORDER_PATH.name} missing).</div>", unsafe_allow_html=True)
 
     with c2:
         st.subheader("Risk / Cortex")

@@ -34,14 +34,20 @@ if LOCAL_ENV.exists():
 
 
 # ---------------------------
-# Constants
+# Constants (product and namespaced paths from config)
 # ---------------------------
-HARDCODED_UUID = os.getenv("ARGUS_PORTFOLIO_ID", "5bce9ffb-611c-4dcb-9e18-75d3914825a1")
-PRODUCT_ID = os.getenv("ARGUS_PRODUCT_ID", "BTC-USD")
+from config import (
+    PRODUCT_ID,
+    TRADE_STATE_PATH,
+    TRADE_STATE_TMP_PATH,
+    TRADE_LEDGER_PATH,
+)
 
-STATE_FILE = PROJECT_ROOT / "trade_state.json"
-STATE_TMP = PROJECT_ROOT / "trade_state.json.tmp"
-LEDGER_FILE = PROJECT_ROOT / "trade_ledger.jsonl"
+HARDCODED_UUID = os.getenv("ARGUS_PORTFOLIO_ID", "5bce9ffb-611c-4dcb-9e18-75d3914825a1")
+
+STATE_FILE = TRADE_STATE_PATH
+STATE_TMP = TRADE_STATE_TMP_PATH
+LEDGER_FILE = TRADE_LEDGER_PATH
 
 
 # ---------------------------

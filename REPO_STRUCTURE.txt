@@ -1,0 +1,255 @@
+IteraDynamics_Mono/
+|-- alpha_engine
+|   |-- .claude
+|   |   +-- settings.local.json
+|   |-- .github
+|   |   +-- workflows
+|   |       |-- backfill-ml-shadow.yml
+|   |       |-- ci-tests.yml
+|   |       |-- convert-signals-to-shadow.yml
+|   |       |-- governance-apply.yml
+|   |       |-- paper-shadow.yml
+|   |       |-- shadow-inference.yml
+|   |       |-- test-ml-improvements.yml
+|   |       +-- walkforward-cv.yml
+|   |-- configs
+|   |   |-- approach_1_regime_filter.sh
+|   |   |-- approach_2_extended_data.sh
+|   |   |-- approach_3_simple_lr.sh
+|   |   +-- approach_4_per_regime.sh
+|   |-- data
+|   |   +-- feedback.jsonl
+|   |-- docs
+|   |   |-- ML_IMPROVEMENTS.md
+|   |   +-- PAPER_TRADING_PARAMS_GUIDE.md
+|   |-- examples
+|   |   +-- use_signal_engine_core.py
+|   |-- logs
+|   |   |-- reviewer_impact_log.jsonl
+|   |   |-- signal_history.jsonl
+|   |   +-- suppression_review_queue.jsonl
+|   |-- models
+|   |   |-- governance_params.json
+|   |   |-- ml_hyperparameters.json
+|   |   +-- paper_trading_params.json
+|   |-- scripts
+|   |   |-- ci
+|   |   |-- dashboard
+|   |   |-- explain
+|   |   |   +-- __init__.py
+|   |   |-- governance
+|   |   |   |-- __init__.py
+|   |   |   |-- drift_response.py
+|   |   |   |-- governance_apply.py
+|   |   |   |-- model_governance_actions.py
+|   |   |   |-- model_lineage.py
+|   |   |   +-- retrain_automation.py
+|   |   |-- market
+|   |   |   +-- __init__.py
+|   |   |-- ml
+|   |   |-- ml_utils
+|   |   |   +-- __init__.py
+|   |   |-- perf
+|   |   |-- social
+|   |   |-- summary_sections
+|   |   |   +-- __init__.py
+|   |   |-- __init__.py
+|   |   +-- ci_build_governance.sh
+|   |-- src
+|   |   |-- adapters
+|   |   |   |-- __init__.py
+|   |   |   |-- inference_service.py
+|   |   |   |-- model_loader.py
+|   |   |   |-- price_adapter.py
+|   |   |   +-- README.md
+|   |   |-- analytics
+|   |   |   |-- burst_detection.py
+|   |   |   |-- lead_lag.py
+|   |   |   |-- nowcast_attention.py
+|   |   |   |-- origin_trends.py
+|   |   |   +-- volatility_regimes.py
+|   |   |-- inference
+|   |   |-- ml
+|   |   |   +-- feature_builder.py
+|   |   |-- utils
+|   |   |-- __init__.py
+|   |   |-- fake_ingest.py
+|   |   |-- price_fetcher.py
+|   |   |-- sentiment_news.py
+|   |   |-- sentiment_reddit.py
+|   |   |-- twitter_ingestor.py
+|   |   +-- utils.py
+|   |-- tests
+|   |   +-- httpbot
+|   |       |-- internal_tests.http
+|   |       +-- smoke_tests.http
+|   |-- tools
+|   |-- __init__.py
+|   |-- build.sh
+|   |-- CLAUDE_CODE_CHANGES.md
+|   |-- devplan.md
+|   |-- devplan_phase3.md
+|   |-- Dockerfile
+|   |-- LICENSE.TXT
+|   |-- PHILOSOPHY.md
+|   |-- README.md
+|   |-- requirements-dev.txt
+|   |-- requirements.txt
+|   |-- run_all_tests.sh
+|   +-- tasklist.md
+|-- data
+|   |-- historical
+|   |   +-- btc_usd_1h.csv
+|   |-- argus_execution.log
+|   |-- btcusd_3600s_2019-01-01_to_2025-12-30.csv
+|   |-- btcusd_3600s_2023-01-01_to_2025-12-30.csv
+|   |-- ethusd_3600s_2019-01-01_to_2025-12-30.csv
+|   +-- my_trades.csv
+|-- iteradynamics_monorepo.egg-info
+|   |-- dependency_links.txt
+|   |-- PKG-INFO
+|   |-- requires.txt
+|   |-- SOURCES.txt
+|   +-- top_level.txt
+|-- moonwire
+|   |-- .github
+|   |   +-- workflows
+|   |   |-- (same as alpha_engine)
+|   |-- configs
+|   |-- data
+|   |-- docs
+|   |-- lib
+|   |   |-- __init__.py
+|   |   |-- feature_builder.py
+|   |   |-- paper_broker.py
+|   |   +-- train_model.py
+|   |-- logs
+|   |-- scripts
+|   |-- src
+|   |   |-- analytics
+|   |   |-- inference
+|   |   |-- ml
+|   |   |-- utils
+|   |   |-- strategies
+|   |   |   +-- ml_adapter.py
+|   |   +-- tests
+|   |-- tools
+|   |-- build.sh
+|   |-- flight_recorder.csv
+|   |-- live_engine.py
+|   |-- paper_state.json
+|   +-- (other files similar to alpha_engine)
+|-- output
+|   +-- wf_runs
+|       +-- (walkforward run outputs)
+|-- research
+|   |-- backtest
+|   |   |-- data
+|   |   |-- __init__.py
+|   |   |-- fill_model.py
+|   |   |-- metrics.py
+|   |   +-- run_grid.py
+|   |-- backtests
+|   |   |-- data
+|   |   |-- experiments
+|   |   +-- results
+|   |       |-- guardian_equity.csv
+|   |       |-- regime_trend_*.csv
+|   |       |-- sentinel_*.csv
+|   |       +-- walkforward_*.csv
+|   |-- engine
+|   |   +-- backtest_core.py
+|   |-- experiments
+|   |   |-- backtest_historical.py
+|   |   |-- offline_backtest.py
+|   |   |-- offline_walkforward.py
+|   |   +-- (other experiments)
+|   |-- legacy
+|   |   |-- apex_core_archive
+|   |   |   +-- (many files)
+|   |   |-- sniper
+|   |   +-- signal_generator_quantile.py
+|   |-- models
+|   |   |-- *.pkl
+|   |-- outputs
+|   |-- strategies
+|   |   |-- guardian.py
+|   |   |-- regime_trend.py
+|   |   |-- sentinel.py
+|   |   |-- sniper_bot.py
+|   |   +-- (others)
+|   |-- run_guardian.py
+|   |-- run_regime_trend.py
+|   |-- run_sentinel.py
+|   |-- run_regime_walkforward.py
+|   +-- STRATEGY_SUMMARY.md
+|-- runtime
+|   +-- argus
+|       |-- apex_core
+|       |   |-- exit_watcher.py
+|       |   |-- signal_generator.py
+|       |   |-- strategy_intent.py
+|       |   +-- strategy_router.py
+|       |-- models
+|       |   |-- governance_params.json
+|       |   |-- ml_hyperparameters.json
+|       |   |-- paper_trading_params.json
+|       |   +-- random_forest.pkl
+|       |-- research
+|       |   |-- diagnostics
+|       |   |   |-- crash_window_report.py
+|       |   |-- harness
+|       |   |   |-- backtest_runner.py
+|       |   |   |-- backtest_smoke.py
+|       |   |   |-- regime_smoke.py
+|       |   |   +-- strategy_smoke.py
+|       |   |-- regime
+|       |   |   +-- regime_engine.py
+|       |   |-- results
+|       |   |   |-- compression_shot
+|       |   |   +-- core_exposure
+|       |   |-- strategies
+|       |   |   |-- sg_compression_shot_v1.py
+|       |   |   |-- sg_compression_shot_v2.py
+|       |   |   |-- sg_compression_shot_v3.py
+|       |   |   |-- sg_core_exposure_v1.py
+|       |   |   |-- sg_core_exposure_v2.py
+|       |   |   |-- sg_regime_trend_v1.py
+|       |   |   |-- sg_stub_strategy.py
+|       |   |   +-- (others)
+|       |   +-- __init__.py
+|       |-- src
+|       |   +-- real_broker.py
+|       |-- argus-eth.env.example
+|       |-- argus-eth.service.example
+|       |-- config.py
+|       |-- dashboard.py
+|       |-- MULTI_PRODUCT.md
+|       |-- run_live.py
+|       |-- sweep_multi_product.py
+|       |-- test_execution.py
+|       |-- (state/log/csv files: flight_recorder*.csv, prime_state.json, etc.)
+|       +-- trade_state.json
+|-- scripts
+|   |-- analysis
+|   |   +-- analyze_trades.py
+|   |-- data
+|   |   |-- data_backfiller.py
+|   |   |-- download_btc_history.py
+|   |   |-- download_coinbase_history.py
+|   |   +-- reconstruct_history.py
+|   |-- debug
+|   |   |-- audit_quick.py
+|   |   |-- debug_coinbase.py
+|   |   |-- inspect_wallet.py
+|   |   +-- (others)
+|   |-- training
+|   |   |-- create_dummy_models.py
+|   |   |-- seed_cortex.py
+|   |   |-- train_hmm.py
+|   |   +-- train_real_models.py
+|   +-- deploy.bat
+|-- pyproject.toml
+|-- README.md
+|-- requirements.txt
++-- (root-level CSV outputs: crash_window_*.csv, window_*.csv, etc.)

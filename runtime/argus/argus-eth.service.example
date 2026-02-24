@@ -1,0 +1,27 @@
+# Example systemd unit for Argus ETH-USD instance.
+# Copy to /etc/systemd/system/argus-eth.service and enable.
+# Keep existing argus-btc.service unchanged; both can run side-by-side.
+#
+# Install:
+#   sudo cp runtime/argus/argus-eth.service.example /etc/systemd/system/argus-eth.service
+#   sudo nano /etc/systemd/system/argus-eth.service   # set User, paths, env file
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now argus-eth
+
+[Unit]
+Description=Argus Prime ETH-USD live scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=argus
+WorkingDirectory=/opt/argus
+EnvironmentFile=/etc/argus/argus-eth.env
+Environment=ARGUS_PRODUCT_ID=ETH-USD
+ExecStart=/opt/argus/venv/bin/python -u run_live.py
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

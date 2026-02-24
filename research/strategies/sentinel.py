@@ -445,3 +445,4 @@ def _compute_summary(trades: pd.DataFrame, equity_curve: pd.DataFrame, initial_c
 
 
 
+

@@ -85,16 +85,30 @@ _broker = RealBroker()
 # Constants / Runtime assets
 # ---------------------------
 
+# Product and namespaced paths (configurable via ARGUS_PRODUCT_ID)
+from config import (
+    PRODUCT_ID,
+    FLIGHT_RECORDER_PATH,
+    TRADE_STATE_PATH,
+    CORTEX_PATH,
+    CORTEX_TMP_PATH,
+    PRIME_STATE_LIVE_PATH,
+    PRIME_STATE_LIVE_TMP_PATH,
+    PRIME_STATE_PAPER_PATH,
+    PRIME_STATE_PAPER_TMP_PATH,
+)
+
 MODELS_DIR = _PROJECT_ROOT / "models"
 MODEL_FILE = os.getenv("ARGUS_MODEL_FILE", "random_forest.pkl")
-DATA_FILE = _PROJECT_ROOT / "flight_recorder.csv"
+DATA_FILE = FLIGHT_RECORDER_PATH
+STATE_FILE = TRADE_STATE_PATH
+CORTEX_FILE = CORTEX_PATH
+CORTEX_TMP = CORTEX_TMP_PATH
+PRIME_STATE_FILE_LIVE = PRIME_STATE_LIVE_PATH
+PRIME_STATE_TMP_LIVE = PRIME_STATE_LIVE_TMP_PATH
+PRIME_STATE_FILE_PAPER = PRIME_STATE_PAPER_PATH
+PRIME_STATE_TMP_PAPER = PRIME_STATE_PAPER_TMP_PATH
 
-CORTEX_FILE = _PROJECT_ROOT / "cortex.json"
-CORTEX_TMP = _PROJECT_ROOT / "cortex.json.tmp"
-
-STATE_FILE = _PROJECT_ROOT / "trade_state.json"  # legacy compat
-
-PRODUCT_ID = "BTC-USD"
 ARGUS_MODE = os.getenv("ARGUS_MODE", "legacy").strip().lower()
 
 
@@ -182,7 +196,7 @@ def _call_external_strategy(fn: Callable[..., Any], df: pd.DataFrame, ctx: "Stra
 def update_market_data() -> None:
     """Fetch latest hourly candles (UTC) and append only new rows."""
     try:
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+        url = f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/candles"
         resp = requests.get(url, params={"granularity": 3600}, timeout=10)
         resp.raise_for_status()
         data = resp.json()

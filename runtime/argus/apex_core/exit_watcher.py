@@ -9,8 +9,9 @@ from typing import Optional
 
 import requests
 
+from config import PRODUCT_ID
 from apex_core.signal_generator import (
-    _load_trade_state,
+    _load_trade_state_legacy,
     MIN_HOLD_HOURS,
     MIN_NOTIONAL_USD,
     PROFIT_HURDLE_PCT,
@@ -65,7 +66,7 @@ def _get_live_price() -> Optional[float]:
         except ValueError:
             pass  # fall through to real API
 
-    url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    url = f"https://api.coinbase.com/v2/prices/{PRODUCT_ID}/spot"
     try:
         resp = requests.get(url, timeout=3)
         resp.raise_for_status()
@@ -126,7 +127,7 @@ def check_exit_window() -> None:
     print(f"[{ts_now}] 🕔 EXIT WATCHER CHECK...")
 
     # 1) Load trade_state
-    state, status = _load_trade_state()
+    state, status = _load_trade_state_legacy()
 
     if status != "OK" or state is None:
         print(

@@ -41,20 +41,22 @@ else:
     load_dotenv(override=False)
 
 # ---------------------------
-# IMPORT TRADING CYCLE
+# IMPORT CONFIG + TRADING CYCLE
 # ---------------------------
 
+from config import log_startup, LOG_PATH  # noqa: E402
 from apex_core.signal_generator import generate_signals  # noqa: E402
 
 
 # ---------------------------
-# LOGGING
+# LOGGING (namespaced per product when not BTC-USD)
 # ---------------------------
 
 class Logger:
-    def __init__(self, logfile: str = "argus.log"):
+    def __init__(self, logfile: str = None):
         self.terminal = sys.stdout
-        self.log = open(logfile, "a", encoding="utf-8")
+        path = logfile or str(LOG_PATH)
+        self.log = open(path, "a", encoding="utf-8")
 
     def write(self, message: str):
         self.terminal.write(message)
@@ -68,6 +70,9 @@ class Logger:
 
 sys.stdout = Logger()
 sys.stderr = sys.stdout
+
+# Minimal diagnostics: product_id and resolved paths
+log_startup()
 
 
 # ---------------------------
@@ -158,9 +163,10 @@ schedule.every().hour.at(":00").do(job)
 
 if __name__ == "__main__":
     mode = os.getenv("ARGUS_MODE", "legacy").strip().lower()
+    product = os.getenv("ARGUS_PRODUCT_ID", "BTC-USD")
     print("🦅 ARGUS LIVE SCHEDULER ONLINE")
     print(f"⏰ UTC Time: {utc_now_str()}")
-    print(f"🧭 ARGUS_MODE: {mode}")
+    print(f"🧭 ARGUS_MODE: {mode}  ARGUS_PRODUCT_ID: {product}")
 
     while not _shutdown_requested:
         schedule.run_pending()
