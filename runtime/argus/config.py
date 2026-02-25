@@ -47,6 +47,45 @@ CORTEX_TMP_PATH = _PROJECT_ROOT / (
 LOG_PATH = _PROJECT_ROOT / ("argus.log" if _USE_LEGACY_NAMES else f"argus_{PRODUCT_SLUG}.log")
 
 
+def get_paths_for_product(product_id: str) -> dict:
+    """Return ledger/state paths for a given product_id (same naming as default config)."""
+    slug = product_id.strip().upper().replace("-", "_").lower()
+    use_legacy = slug == "btc_usd"
+    name_ledger = "trade_ledger.jsonl" if use_legacy else f"trade_ledger_{slug}.jsonl"
+    name_state = "trade_state.json" if use_legacy else f"trade_state_{slug}.json"
+    name_state_tmp = "trade_state.json.tmp" if use_legacy else f"trade_state_{slug}.json.tmp"
+    return {
+        "product_id": product_id.strip().upper(),
+        "ledger_path": _PROJECT_ROOT / name_ledger,
+        "state_path": _PROJECT_ROOT / name_state,
+        "state_tmp_path": _PROJECT_ROOT / name_state_tmp,
+    }
+
+
+# Portfolio policy (for run_portfolio_live; deterministic PortfolioPolicy from env)
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name, "")
+    if v == "":
+        return default
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_bool_portfolio(name: str, default: bool) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    if v == "":
+        return default
+    return v in ("1", "true", "yes", "y", "on")
+
+
+PORTFOLIO_MAX_GROSS_EXPOSURE = _env_float("PORTFOLIO_MAX_GROSS_EXPOSURE", 1.0)
+PORTFOLIO_MAX_WEIGHT_PER_ASSET = _env_float("PORTFOLIO_MAX_WEIGHT_PER_ASSET", 0.85)
+PORTFOLIO_MIN_WEIGHT_PER_ASSET = _env_float("PORTFOLIO_MIN_WEIGHT_PER_ASSET", 0.0)
+PORTFOLIO_ALLOW_CASH = _env_bool_portfolio("PORTFOLIO_ALLOW_CASH", True)
+
+
 def log_startup() -> None:
     """Print product_id and resolved paths at startup (minimal diagnostics)."""
     print(f"[config] ARGUS_PRODUCT_ID={PRODUCT_ID} (slug={PRODUCT_SLUG})")

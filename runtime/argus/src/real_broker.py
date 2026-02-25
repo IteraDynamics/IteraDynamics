@@ -1,5 +1,5 @@
 # src/real_broker.py
-# 🦅 ARGUS REAL BROKER - V9.5.1 (FULL REPLACEMENT)
+# ARGUS REAL BROKER - V9.5.1 (FULL REPLACEMENT)
 # (V9.5 + MAKER BUY SIZING FIX: maker entry now uses SAME USD BUDGET as v9.4 market entry
 #  + SAFE MAKER BUY PATH: POST-ONLY LIMIT ENTRY + TIMEOUT/CANCEL + MARKET FALLBACK
 #  + PRESERVES: SOP-SAFE ENV LOADING + ATOMIC STATE + IDEMPOTENCY + TZ-AWARE UTC + DRY-RUN SUPPORT
@@ -36,12 +36,22 @@ if LOCAL_ENV.exists():
 # ---------------------------
 # Constants (product and namespaced paths from config)
 # ---------------------------
-from config import (
-    PRODUCT_ID,
-    TRADE_STATE_PATH,
-    TRADE_STATE_TMP_PATH,
-    TRADE_LEDGER_PATH,
-)
+try:
+    from runtime.argus.config import (
+        PRODUCT_ID,
+        TRADE_STATE_PATH,
+        TRADE_STATE_TMP_PATH,
+        TRADE_LEDGER_PATH,
+        get_paths_for_product,
+    )
+except ImportError:
+    from config import (
+        PRODUCT_ID,
+        TRADE_STATE_PATH,
+        TRADE_STATE_TMP_PATH,
+        TRADE_LEDGER_PATH,
+        get_paths_for_product,
+    )
 
 HARDCODED_UUID = os.getenv("ARGUS_PORTFOLIO_ID", "5bce9ffb-611c-4dcb-9e18-75d3914825a1")
 
@@ -157,14 +167,26 @@ class RealBroker:
       then compute base_size = usd_budget / limit_price (8dp, rounded down).
     """
 
-    def __init__(self):
+    def __init__(self, product_id: Optional[str] = None):
         self.api_key = os.getenv("COINBASE_API_KEY") or os.getenv("CB_API_KEY")
         self.api_secret = os.getenv("COINBASE_API_SECRET") or os.getenv("CB_API_SECRET")
 
         if not self.api_key or not self.api_secret:
-            raise ValueError("❌ MISSING API KEYS in env (.env or /etc/argus/argus.env)")
+            raise ValueError("[RealBroker] MISSING API KEYS in env (.env or /etc/argus/argus.env)")
 
         self.api_secret = self.api_secret.replace("\\n", "\n")
+
+        if product_id is not None:
+            paths = get_paths_for_product(product_id)
+            self._product_id = paths["product_id"]
+            self._ledger_file = paths["ledger_path"]
+            self._state_file = paths["state_path"]
+            self._state_tmp = paths["state_tmp_path"]
+        else:
+            self._product_id = PRODUCT_ID
+            self._ledger_file = LEDGER_FILE
+            self._state_file = STATE_FILE
+            self._state_tmp = STATE_TMP
 
         self.dry_run = _env_bool("ARGUS_DRY_RUN", default=False)
         self.dry_run_ledger = _env_bool("ARGUS_DRY_RUN_LOG_LEDGER", default=False)
@@ -184,9 +206,9 @@ class RealBroker:
             self.client = RESTClient(api_key=self.api_key, api_secret=self.api_secret)
             mode_str = "DRY-RUN (no live orders)" if self.dry_run else "LIVE"
             maker_str = " | MAKER_ENTRY=ON" if (not self.dry_run and self.maker_entry_enabled) else ""
-            print(f"🔌 RealBroker: Connected. TARGETING UUID: {HARDCODED_UUID} | MODE: {mode_str}{maker_str}")
+            print(f"[RealBroker] Connected. TARGETING UUID: {HARDCODED_UUID} | MODE: {mode_str}{maker_str}")
         except Exception as e:
-            print(f"❌ CONNECTION ERROR: {e}")
+            print(f"[RealBroker] CONNECTION ERROR: {e}")
             raise
 
     # ---------------------------
@@ -205,17 +227,18 @@ class RealBroker:
     def get_wallet_snapshot(self) -> Tuple[float, float]:
         response = self._get_accounts()
         cash = 0.0
-        btc = 0.0
+        base_bal = 0.0
+        base_currency = (self._product_id.split("-")[0] if "-" in self._product_id else "BTC").upper()
         for acc in getattr(response, "accounts", []):
-            ccy = getattr(acc, "currency", "")
+            ccy = (getattr(acc, "currency", "") or "").upper()
             if ccy == "USD":
                 cash = self._get_value(getattr(acc, "available_balance", None))
-            elif ccy == "BTC":
-                btc = self._get_value(getattr(acc, "available_balance", None))
+            elif ccy == base_currency:
+                base_bal = self._get_value(getattr(acc, "available_balance", None))
 
         self._last_cash = cash
-        self._last_btc = btc
-        return cash, btc
+        self._last_btc = base_bal
+        return cash, base_bal
 
     @property
     def cash(self) -> float:
@@ -229,17 +252,17 @@ class RealBroker:
     # trade_state.json (atomic)
     # ---------------------------
     def save_trade_state(self, entry: dict) -> None:
-        _atomic_write_json(STATE_FILE, STATE_TMP, entry)
+        _atomic_write_json(self._state_file, self._state_tmp, entry)
         ep = float(entry.get("entry_price", 0.0))
-        print(f"💾 Trade state saved: Entry at ${ep:.2f} (fill-based)")
+        print(f"[RealBroker] Trade state saved: Entry at ${ep:.2f} (fill-based)")
 
     def clear_trade_state(self) -> None:
         try:
-            if STATE_FILE.exists():
-                STATE_FILE.unlink()
-                print("🗑️ Trade state cleared.")
+            if self._state_file.exists():
+                self._state_file.unlink()
+                print("[RealBroker] Trade state cleared.")
         except Exception as e:
-            print(f"❌ FAILED TO CLEAR TRADE STATE: {e}")
+            print(f"[RealBroker] FAILED TO CLEAR TRADE STATE: {e}")
             raise
 
     # ---------------------------
@@ -335,7 +358,7 @@ class RealBroker:
         last_seen = None
         while time.time() < deadline:
             resp = self.client.list_orders(
-                product_ids=[PRODUCT_ID],
+                product_ids=[self._product_id],
                 retail_portfolio_id=HARDCODED_UUID,
                 limit=limit,
             )
@@ -351,7 +374,7 @@ class RealBroker:
 
         # If we found the order but it still had no order_id (unlikely), print debug
         if last_seen is not None:
-            print(f"   ⚠️ Reconcile saw order but no order_id yet | client_order_id={client_order_id} | side={side_u}")
+            print(f"   [WARN] Reconcile saw order but no order_id yet | client_order_id={client_order_id} | side={side_u}")
         return None
 
     def _wait_for_terminal_order(self, order_id: str, timeout_s: int = 60, poll_s: float = 1.0) -> Any:
@@ -445,7 +468,7 @@ class RealBroker:
         If unavailable, returns None (caller must be conservative).
         """
         try:
-            prod = self.client.get_product(PRODUCT_ID)
+            prod = self.client.get_product(self._product_id)
             qi = None
             if isinstance(prod, dict):
                 qi = prod.get("quote_increment") or prod.get("quote_increment_value") or prod.get("quote_increment_decimal")
@@ -463,7 +486,7 @@ class RealBroker:
         Returns (best_bid, best_ask) as Decimals, or (None, None) if unavailable.
         """
         try:
-            resp = self.client.get_best_bid_ask(product_ids=[PRODUCT_ID])
+            resp = self.client.get_best_bid_ask(product_ids=[self._product_id])
             # Response shape varies; handle common patterns:
             # - {"pricebooks":[{"product_id":"BTC-USD","bids":[{"price":"..."}],"asks":[{"price":"..."}]}]}
             # - {"best_bid_asks":[{"product_id":"BTC-USD","bid":"...","ask":"..."}]}
@@ -472,7 +495,7 @@ class RealBroker:
                 pbs = resp.get("pricebooks") or resp.get("price_books") or resp.get("pricebook") or []
                 if isinstance(pbs, list):
                     for pb in pbs:
-                        if (pb.get("product_id") or "") == PRODUCT_ID:
+                        if (pb.get("product_id") or "") == self._product_id:
                             bid = None
                             ask = None
                             bids = pb.get("bids") or []
@@ -487,7 +510,7 @@ class RealBroker:
                 bba = resp.get("best_bid_asks") or resp.get("best_bid_ask") or resp.get("products") or []
                 if isinstance(bba, list):
                     for row in bba:
-                        if (row.get("product_id") or "") == PRODUCT_ID:
+                        if (row.get("product_id") or "") == self._product_id:
                             bid = row.get("bid") or row.get("best_bid")
                             ask = row.get("ask") or row.get("best_ask")
                             return (Decimal(str(bid)) if bid else None, Decimal(str(ask)) if ask else None)
@@ -495,7 +518,7 @@ class RealBroker:
             # Object-style fallback
             rows = _get(resp, "pricebooks", None) or _get(resp, "best_bid_asks", None) or []
             for row in rows or []:
-                if (_get(row, "product_id", "") or "") == PRODUCT_ID:
+                if (_get(row, "product_id", "") or "") == self._product_id:
                     bid = _get(row, "bid", None) or _get(row, "best_bid", None)
                     ask = _get(row, "ask", None) or _get(row, "best_ask", None)
                     return (Decimal(str(bid)) if bid else None, Decimal(str(ask)) if ask else None)
@@ -513,7 +536,7 @@ class RealBroker:
             try:
                 return self.client.limit_order_gtc_buy(
                     client_order_id=client_order_id,
-                    product_id=PRODUCT_ID,
+                    product_id=self._product_id,
                     base_size=str(base_size),
                     limit_price=str(limit_price),
                     post_only=True,
@@ -521,14 +544,14 @@ class RealBroker:
             except TypeError:
                 return self.client.limit_order_gtc_buy(
                     client_order_id=client_order_id,
-                    product_id=PRODUCT_ID,
+                    product_id=self._product_id,
                     base_size=str(base_size),
                     limit_price=str(limit_price),
                 )
         except Exception:
             return self.client.create_order(
                 client_order_id=client_order_id,
-                product_id=PRODUCT_ID,
+                product_id=self._product_id,
                 side="BUY",
                 order_configuration={
                     "limit_limit_gtc": {
@@ -550,7 +573,7 @@ class RealBroker:
                 return
             self.client.cancel_orders(order_ids=[order_id])
         except Exception as e:
-            print(f"   ⚠️ CANCEL ERROR (non-fatal) | order_id={order_id} | {e}")
+            print(f"   [WARN] CANCEL ERROR (non-fatal) | order_id={order_id} | {e}")
 
     def _wait_for_fill_or_timeout(
         self,
@@ -592,7 +615,7 @@ class RealBroker:
                     return (last_status, last_fill)
 
             except Exception as e:
-                print(f"   ⚠️ POLL ERROR (non-fatal) | order_id={order_id} | {e}")
+                print(f"   [WARN] POLL ERROR (non-fatal) | order_id={order_id} | {e}")
 
             time.sleep(max(0.25, float(poll_s)))
 
@@ -651,19 +674,19 @@ class RealBroker:
             raise ValueError(f"Computed base_size invalid: {base_size}")
 
         print(
-            f"   🧾 MAKER BUY ATTEMPT: ~${float(usd_size):.2f} => {base_size} BTC @ ${float(limit_price):.2f} "
+            f"   [MAKER] MAKER BUY ATTEMPT: ~${float(usd_size):.2f} => {base_size} BTC @ ${float(limit_price):.2f} "
             f"(bid={float(best_bid) if best_bid else 0.0:.2f}, ask={float(best_ask) if best_ask else 0.0:.2f}) "
             f"(client_order_id={client_order_id})"
         )
 
         # Optional audit line for attempt (does not mutate trade_state)
         _append_jsonl(
-            LEDGER_FILE,
+            self._ledger_file,
             {
                 "ts": _now_utc_iso(),
                 "side": "BUY_MAKER_ATTEMPT",
                 "client_order_id": str(client_order_id),
-                "product_id": PRODUCT_ID,
+                "product_id": self._product_id,
                 "usd_budget": float(usd_size),
                 "base_size": float(base_size),
                 "limit_price": float(limit_price),
@@ -680,13 +703,13 @@ class RealBroker:
         order_id = self._extract_order_id(resp)
 
         if not order_id and self._response_looks_accepted(resp):
-            print("   ⚠️ MAKER BUY accepted but missing order_id; reconciling via list_orders(client_order_id)...")
+            print("   [WARN] MAKER BUY accepted but missing order_id; reconciling via list_orders(client_order_id)...")
             order_id = self._reconcile_order_id_by_client_order_id(client_order_id, side="BUY")
 
         if not order_id:
-            print("   ❌ MAKER BUY ERROR: No order_id returned and reconcile failed.")
+            print("   [RealBroker] MAKER BUY ERROR: No order_id returned and reconcile failed.")
             if self.maker_fallback_market:
-                print("   🔁 MAKER BUY fallback → MARKET BUY (existing path).")
+                print("   [RealBroker] MAKER BUY fallback -> MARKET BUY (existing path).")
                 return self._execute_market_buy_existing(qty_btc=qty_btc, signal_price=signal_price, client_order_id=uuid.uuid4().hex)
             return False
 
@@ -709,7 +732,7 @@ class RealBroker:
                 "entry_filled_quote": float(fill_sum["filled_quote"]),
                 "entry_order_id": str(order_id),
                 "entry_client_order_id": str(client_order_id),
-                "product_id": PRODUCT_ID,
+                "product_id": self._product_id,
                 "execution": {
                     "entry_mode": "maker",
                     "maker_limit_price": float(limit_price),
@@ -726,13 +749,13 @@ class RealBroker:
             self.save_trade_state(entry_state)
 
             _append_jsonl(
-                LEDGER_FILE,
+                self._ledger_file,
                 {
                     "ts": _now_utc_iso(),
                     "side": "BUY",
                     "order_id": str(order_id),
                     "client_order_id": str(client_order_id),
-                    "product_id": PRODUCT_ID,
+                    "product_id": self._product_id,
                     "avg_price": float(fill_sum["avg_price"]),
                     "filled_base": float(fill_sum["filled_base"]),
                     "filled_quote": float(fill_sum["filled_quote"]),
@@ -747,14 +770,14 @@ class RealBroker:
             )
 
             print(
-                f"   ✅ MAKER BUY FILLED | avg=${fill_sum['avg_price']:.2f} "
+                f"   [OK] MAKER BUY FILLED | avg=${fill_sum['avg_price']:.2f} "
                 f"| fees=${fill_sum['fees_quote']:.4f} ({fill_sum['fee_rate']*100:.2f}%)"
             )
             return True
 
         if status == "PARTIAL":
             # Safety: cancel remainder BEFORE committing state, then re-check final status & fills.
-            print(f"   ⚠️ MAKER BUY PARTIAL | filled_base={fill_sum.get('filled_base', 0.0):.8f} BTC | canceling remainder...")
+            print(f"   [WARN] MAKER BUY PARTIAL | filled_base={fill_sum.get('filled_base', 0.0):.8f} BTC | canceling remainder...")
             self._cancel_order_best_effort(order_id)
 
             # Wait briefly for terminal after cancel (could become FILLED during cancel race)
@@ -763,9 +786,9 @@ class RealBroker:
             fill_sum = self._summarize_fills(order_id)  # refresh
 
             if fill_sum.get("filled_base", 0.0) <= 0.0:
-                print(f"   ❌ MAKER BUY PARTIAL PATH: Cancelled/terminal but no fills recorded | status={final_status or 'UNKNOWN'}")
+                print(f"   [RealBroker] MAKER BUY PARTIAL PATH: Cancelled/terminal but no fills recorded | status={final_status or 'UNKNOWN'}")
                 if self.maker_fallback_market:
-                    print("   🔁 MAKER BUY fallback → MARKET BUY (existing path).")
+                    print("   [RealBroker] MAKER BUY fallback -> MARKET BUY (existing path).")
                     return self._execute_market_buy_existing(qty_btc=qty_btc, signal_price=signal_price, client_order_id=uuid.uuid4().hex)
                 return False
 
@@ -779,7 +802,7 @@ class RealBroker:
                 "entry_filled_quote": float(fill_sum["filled_quote"]),
                 "entry_order_id": str(order_id),
                 "entry_client_order_id": str(client_order_id),
-                "product_id": PRODUCT_ID,
+                "product_id": self._product_id,
                 "execution": {
                     "entry_mode": "maker",
                     "maker_limit_price": float(limit_price),
@@ -797,13 +820,13 @@ class RealBroker:
             self.save_trade_state(entry_state)
 
             _append_jsonl(
-                LEDGER_FILE,
+                self._ledger_file,
                 {
                     "ts": _now_utc_iso(),
                     "side": "BUY",
                     "order_id": str(order_id),
                     "client_order_id": str(client_order_id),
-                    "product_id": PRODUCT_ID,
+                    "product_id": self._product_id,
                     "avg_price": float(fill_sum["avg_price"]),
                     "filled_base": float(fill_sum["filled_base"]),
                     "filled_quote": float(fill_sum["filled_quote"]),
@@ -820,26 +843,26 @@ class RealBroker:
             )
 
             print(
-                f"   ✅ MAKER BUY PARTIAL (ENTERED) | avg=${fill_sum['avg_price']:.2f} "
+                f"   [OK] MAKER BUY PARTIAL (ENTERED) | avg=${fill_sum['avg_price']:.2f} "
                 f"| filled_base={fill_sum['filled_base']:.8f} BTC "
                 f"| fees=${fill_sum['fees_quote']:.4f} ({fill_sum['fee_rate']*100:.2f}%)"
             )
             return True
 
         if status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"}:
-            print(f"   ❌ MAKER BUY NOT FILLED | status={status} | order_id={order_id}")
+            print(f"   [RealBroker] MAKER BUY NOT FILLED | status={status} | order_id={order_id}")
             # No fill; safe to fallback if enabled
             if self.maker_fallback_market:
-                print("   🔁 MAKER BUY fallback → MARKET BUY (existing path).")
+                print("   [RealBroker] MAKER BUY fallback -> MARKET BUY (existing path).")
                 return self._execute_market_buy_existing(qty_btc=qty_btc, signal_price=signal_price, client_order_id=uuid.uuid4().hex)
             return False
 
         # TIMEOUT or UNKNOWN: cancel and fallback
-        print(f"   ⏳ MAKER BUY TIMEOUT/NO-FILL | status={status} | canceling | order_id={order_id}")
+        print(f"   [RealBroker] MAKER BUY TIMEOUT/NO-FILL | status={status} | canceling | order_id={order_id}")
         self._cancel_order_best_effort(order_id)
 
         if self.maker_fallback_market:
-            print("   🔁 MAKER BUY fallback → MARKET BUY (existing path).")
+            print("   [RealBroker] MAKER BUY fallback -> MARKET BUY (existing path).")
             return self._execute_market_buy_existing(qty_btc=qty_btc, signal_price=signal_price, client_order_id=uuid.uuid4().hex)
 
         return False
@@ -855,10 +878,10 @@ class RealBroker:
         if usd_size <= 0:
             raise ValueError(f"Computed usd_size invalid: {usd_size}")
 
-        print(f"   🚀 ROUTING BUY: ${usd_size} (client_order_id={client_order_id})")
+        print(f"   [RealBroker] ROUTING BUY: ${usd_size} (client_order_id={client_order_id})")
         resp = self.client.market_order_buy(
             client_order_id=client_order_id,
-            product_id=PRODUCT_ID,
+            product_id=self._product_id,
             quote_size=str(usd_size),
         )
 
@@ -866,18 +889,18 @@ class RealBroker:
 
         # If missing, but response implies accepted, reconcile by client_order_id
         if not order_id and self._response_looks_accepted(resp):
-            print("   ⚠️ BUY accepted but missing order_id; reconciling via list_orders(client_order_id)...")
+            print("   [WARN] BUY accepted but missing order_id; reconciling via list_orders(client_order_id)...")
             order_id = self._reconcile_order_id_by_client_order_id(client_order_id, side="BUY")
 
         if not order_id:
-            print("   ❌ BUY ERROR: No order_id returned and reconcile failed.")
+            print("   [RealBroker] BUY ERROR: No order_id returned and reconcile failed.")
             return False
 
         final_order = self._wait_for_terminal_order(order_id)
         status = (_get(final_order, "status", "") or "").upper().strip()
 
         if status != "FILLED":
-            print(f"   ❌ BUY NOT FILLED | status={status or 'UNKNOWN'} | order_id={order_id}")
+            print(f"   [RealBroker] BUY NOT FILLED | status={status or 'UNKNOWN'} | order_id={order_id}")
             return False
 
         fill_sum = self._summarize_fills(order_id)
@@ -891,7 +914,7 @@ class RealBroker:
             "entry_filled_quote": float(fill_sum["filled_quote"]),
             "entry_order_id": str(order_id),
             "entry_client_order_id": str(client_order_id),
-            "product_id": PRODUCT_ID,
+            "product_id": self._product_id,
             "execution": {
                 "entry_mode": "market",
                 "fallback_used": False,
@@ -901,13 +924,13 @@ class RealBroker:
         self.save_trade_state(entry_state)
 
         _append_jsonl(
-            LEDGER_FILE,
+            self._ledger_file,
             {
                 "ts": _now_utc_iso(),
                 "side": "BUY",
                 "order_id": str(order_id),
                 "client_order_id": str(client_order_id),
-                "product_id": PRODUCT_ID,
+                "product_id": self._product_id,
                 "avg_price": float(fill_sum["avg_price"]),
                 "filled_base": float(fill_sum["filled_base"]),
                 "filled_quote": float(fill_sum["filled_quote"]),
@@ -919,7 +942,7 @@ class RealBroker:
         )
 
         print(
-            f"   ✅ BUY FILLED | avg=${fill_sum['avg_price']:.2f} "
+            f"   [OK] BUY FILLED | avg=${fill_sum['avg_price']:.2f} "
             f"| fees=${fill_sum['fees_quote']:.4f} ({fill_sum['fee_rate']*100:.2f}%)"
         )
         return True
@@ -958,13 +981,13 @@ class RealBroker:
 
                     if self.dry_run_ledger:
                         _append_jsonl(
-                            LEDGER_FILE,
+                            self._ledger_file,
                             {
                                 "ts": _now_utc_iso(),
                                 "mode": "DRY_RUN",
                                 "side": "BUY",
                                 "client_order_id": client_order_id,
-                                "product_id": PRODUCT_ID,
+                                "product_id": self._product_id,
                                 "signal_price": float(price),
                                 "target_quote_usd": float(usd_size),
                                 "target_base_btc": float(qty),
@@ -981,13 +1004,13 @@ class RealBroker:
 
                     if self.dry_run_ledger:
                         _append_jsonl(
-                            LEDGER_FILE,
+                            self._ledger_file,
                             {
                                 "ts": _now_utc_iso(),
                                 "mode": "DRY_RUN",
                                 "side": "SELL",
                                 "client_order_id": client_order_id,
-                                "product_id": PRODUCT_ID,
+                                "product_id": self._product_id,
                                 "target_base_btc": float(btc_size),
                                 "signal_price": float(price) if price else 0.0,
                             },
@@ -1009,9 +1032,9 @@ class RealBroker:
                     raise ValueError("BUY requires a valid price to compute quote_size")
 
                 # Idempotency guard: if we already have a state file, do not double-enter.
-                existing = _load_state(STATE_FILE)
+                existing = _load_state(self._state_file)
                 if existing is not None:
-                    print("   ❌ BUY BLOCKED: trade_state.json already exists (position may already be open).")
+                    print("   [RealBroker] BUY BLOCKED: trade_state.json already exists (position may already be open).")
                     return False
 
                 # Optional maker entry path (minimal extension)
@@ -1031,40 +1054,40 @@ class RealBroker:
             if btc_size <= 0:
                 raise ValueError(f"Computed btc_size invalid: {btc_size}")
 
-            print(f"   🚀 ROUTING SELL: {btc_size} BTC (client_order_id={client_order_id})")
+            print(f"   [RealBroker] ROUTING SELL: {btc_size} BTC (client_order_id={client_order_id})")
             resp = self.client.market_order_sell(
                 client_order_id=client_order_id,
-                product_id=PRODUCT_ID,
+                product_id=self._product_id,
                 base_size=str(btc_size),
             )
 
             order_id = self._extract_order_id(resp)
 
             if not order_id and self._response_looks_accepted(resp):
-                print("   ⚠️ SELL accepted but missing order_id; reconciling via list_orders(client_order_id)...")
+                print("   [WARN] SELL accepted but missing order_id; reconciling via list_orders(client_order_id)...")
                 order_id = self._reconcile_order_id_by_client_order_id(client_order_id, side="SELL")
 
             if not order_id:
-                print("   ❌ SELL ERROR: No order_id returned and reconcile failed.")
+                print("   [RealBroker] SELL ERROR: No order_id returned and reconcile failed.")
                 return False
 
             final_order = self._wait_for_terminal_order(order_id)
             status = (_get(final_order, "status", "") or "").upper().strip()
 
             if status != "FILLED":
-                print(f"   ❌ SELL NOT FILLED | status={status or 'UNKNOWN'} | order_id={order_id}")
+                print(f"   [RealBroker] SELL NOT FILLED | status={status or 'UNKNOWN'} | order_id={order_id}")
                 return False
 
             fill_sum = self._summarize_fills(order_id)
 
             _append_jsonl(
-                LEDGER_FILE,
+                self._ledger_file,
                 {
                     "ts": _now_utc_iso(),
                     "side": "SELL",
                     "order_id": str(order_id),
                     "client_order_id": str(client_order_id),
-                    "product_id": PRODUCT_ID,
+                    "product_id": self._product_id,
                     "avg_price": float(fill_sum["avg_price"]),
                     "filled_base": float(fill_sum["filled_base"]),
                     "filled_quote": float(fill_sum["filled_quote"]),
@@ -1077,11 +1100,153 @@ class RealBroker:
             self.clear_trade_state()
 
             print(
-                f"   ✅ SELL FILLED | avg=${fill_sum['avg_price']:.2f} "
+                f"   [OK] SELL FILLED | avg=${fill_sum['avg_price']:.2f} "
                 f"| fees=${fill_sum['fees_quote']:.4f} ({fill_sum['fee_rate']*100:.2f}%)"
             )
             return True
 
         except Exception as e:
-            print(f"   ❌ ORDER ERROR: {e}")
+            print(f"   [RealBroker] ORDER ERROR: {e}")
             return False
+
+    def execute_portfolio_trade(
+        self, side: str, base_qty: float, price: float | None = None
+    ) -> Dict[str, Any]:
+        """
+        Portfolio rebalance: place market BUY (quote_size) or SELL (base_size).
+        No trade_state.json read/write/clear; one JSONL ledger line with mode="PORTFOLIO".
+        Returns dict with executed, order_id, client_order_id, filled_base, filled_quote,
+        avg_price, fees_quote, fee_rate, num_fills; on error or dry-run simulated fields.
+        """
+        side_u = side.upper().strip()
+        if side_u not in {"BUY", "SELL"}:
+            raise ValueError(f"UNKNOWN side={side}")
+        if base_qty is None or base_qty <= 0:
+            raise ValueError(f"INVALID base_qty={base_qty}")
+
+        client_order_id = uuid.uuid4().hex
+        result: Dict[str, Any] = {
+            "executed": False,
+            "order_id": None,
+            "client_order_id": client_order_id,
+            "filled_base": 0.0,
+            "filled_quote": 0.0,
+            "avg_price": 0.0,
+            "fees_quote": 0.0,
+            "fee_rate": 0.0,
+            "num_fills": 0,
+            "error": None,
+        }
+
+        # ---------------------------
+        # DRY-RUN
+        # ---------------------------
+        if self.dry_run:
+            result["executed"] = True
+            if side_u == "BUY" and price and price > 0:
+                quote_size = (Decimal(str(base_qty)) * Decimal(str(price))).quantize(
+                    Decimal("0.01"), rounding=ROUND_DOWN
+                )
+                result["filled_quote"] = float(quote_size)
+                result["filled_base"] = base_qty
+                result["avg_price"] = price
+            else:
+                result["filled_base"] = base_qty
+                result["filled_quote"] = (base_qty * price) if price and price > 0 else 0.0
+                result["avg_price"] = price or 0.0
+            if self.dry_run_ledger:
+                _append_jsonl(
+                    self._ledger_file,
+                    {
+                        "ts": _now_utc_iso(),
+                        "mode": "PORTFOLIO",
+                        "side": side_u,
+                        "product_id": self._product_id,
+                        "order_id": None,
+                        "client_order_id": client_order_id,
+                        "avg_price": result["avg_price"],
+                        "filled_base": result["filled_base"],
+                        "filled_quote": result["filled_quote"],
+                        "fees_quote": 0.0,
+                        "fee_rate": 0.0,
+                        "num_fills": 0,
+                    },
+                )
+            return result
+
+        # ---------------------------
+        # LIVE
+        # ---------------------------
+        try:
+            if side_u == "BUY":
+                if price is None or price <= 0:
+                    result["error"] = "BUY requires a valid price to compute quote_size"
+                    return result
+                usd_size = (Decimal(str(base_qty)) * Decimal(str(price))).quantize(
+                    Decimal("0.01"), rounding=ROUND_DOWN
+                )
+                if usd_size <= 0:
+                    result["error"] = "Computed quote_size invalid"
+                    return result
+                resp = self.client.market_order_buy(
+                    client_order_id=client_order_id,
+                    product_id=self._product_id,
+                    quote_size=str(usd_size),
+                )
+            else:
+                btc_size = Decimal(str(base_qty)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+                if btc_size <= 0:
+                    result["error"] = "Computed base_size invalid"
+                    return result
+                resp = self.client.market_order_sell(
+                    client_order_id=client_order_id,
+                    product_id=self._product_id,
+                    base_size=str(btc_size),
+                )
+
+            order_id = self._extract_order_id(resp)
+            if not order_id and self._response_looks_accepted(resp):
+                order_id = self._reconcile_order_id_by_client_order_id(
+                    client_order_id, side=side_u
+                )
+            if not order_id:
+                result["error"] = "No order_id returned and reconcile failed"
+                return result
+
+            final_order = self._wait_for_terminal_order(order_id)
+            status = (_get(final_order, "status", "") or "").upper().strip()
+            if status != "FILLED":
+                result["error"] = f"Order not FILLED: status={status}"
+                return result
+
+            fill_sum = self._summarize_fills(order_id)
+            result["executed"] = True
+            result["order_id"] = str(order_id)
+            result["filled_base"] = float(fill_sum["filled_base"])
+            result["filled_quote"] = float(fill_sum["filled_quote"])
+            result["avg_price"] = float(fill_sum["avg_price"])
+            result["fees_quote"] = float(fill_sum["fees_quote"])
+            result["fee_rate"] = float(fill_sum["fee_rate"])
+            result["num_fills"] = int(fill_sum["num_fills"])
+
+            _append_jsonl(
+                self._ledger_file,
+                {
+                    "ts": _now_utc_iso(),
+                    "mode": "PORTFOLIO",
+                    "side": side_u,
+                    "product_id": self._product_id,
+                    "order_id": str(order_id),
+                    "client_order_id": client_order_id,
+                    "avg_price": result["avg_price"],
+                    "filled_base": result["filled_base"],
+                    "filled_quote": result["filled_quote"],
+                    "fees_quote": result["fees_quote"],
+                    "fee_rate": result["fee_rate"],
+                    "num_fills": result["num_fills"],
+                },
+            )
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
