@@ -436,6 +436,14 @@ def main() -> Dict[str, Any]:
     df = load_flight_recorder(data_file)
     print(f"  -> {len(df):,} rows ({df['Timestamp'].iloc[0]} to {df['Timestamp'].iloc[-1]})")
 
+    # Optional: limit bars for fast trace generation (debug only)
+    debug_max_bars = _env_int("ARGUS_DEBUG_TRACE_MAX_BARS", 0)
+    if debug_max_bars > 0:
+        cap = lookback + debug_max_bars
+        if len(df) > cap:
+            df = df.iloc[:cap].copy()
+            print(f"  -> Limited to first {debug_max_bars} trading bars for trace (ARGUS_DEBUG_TRACE_MAX_BARS)")
+
     # Run backtest
     print("Running backtest...")
     equity_df, metrics = run_backtest(
@@ -447,6 +455,33 @@ def main() -> Dict[str, Any]:
         slippage_bps=slippage_bps,
         closed_only=True,
     )
+
+    # Per-bar trace export for behavioral diff (BTC-only; same dataset/env/date window)
+    repo_root = Path(__file__).resolve().parents[4]
+    debug_dir = repo_root / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = debug_dir / "harness_btc_trace.csv"
+    n_eq = len(equity_df)
+    next_bar_return = np.full(n_eq, np.nan, dtype=float)
+    for j in range(n_eq - 1):
+        idx_cur = lookback + j
+        idx_next = lookback + j + 1
+        if idx_next < len(df):
+            next_bar_return[j] = (float(df.loc[idx_next, "Close"]) / float(df.loc[idx_cur, "Close"])) - 1.0
+    eq_arr = equity_df["equity"].to_numpy(dtype=float)
+    portfolio_return = np.full(n_eq, np.nan, dtype=float)
+    for j in range(n_eq - 1):
+        portfolio_return[j] = (eq_arr[j + 1] / eq_arr[j]) - 1.0
+    trace_df = pd.DataFrame({
+        "timestamp": equity_df["Timestamp"],
+        "close_price": equity_df["price"],
+        "exposure": equity_df["exposure"],
+        "next_bar_return": next_bar_return,
+        "portfolio_return": portfolio_return,
+        "equity": equity_df["equity"],
+    })
+    trace_df.to_csv(trace_path, index=False)
+    print(f"Trace written: {trace_path}")
 
     # Print results
     print("\n" + "=" * 60)
