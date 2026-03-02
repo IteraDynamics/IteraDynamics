@@ -289,11 +289,14 @@ def run_backtest(
 
         target_expo = max(0.0, min(1.0, target_expo))
 
-        # Rebalance position
+        # Rebalance position (track cost and rebalance for trace diagnostics)
         target_pos_value = equity * target_expo
         delta_value = target_pos_value - pos_value
+        cost_this_bar = 0.0
+        rebalanced = False
 
         if abs(delta_value) > 1.0:  # Min trade threshold $1
+            rebalanced = True
             if delta_value > 0:
                 # BUY
                 fill_price = price * (1.0 + slip_rate)
@@ -303,6 +306,7 @@ def run_backtest(
                 if cost <= cash:
                     cash -= cost
                     pos_qty += qty_to_buy
+                    cost_this_bar = cost - delta_value  # fee + slippage in $ (we pay more than fair value)
             else:
                 # SELL
                 fill_price = price * (1.0 - slip_rate)
@@ -313,6 +317,7 @@ def run_backtest(
                     proceeds = qty_to_sell * fill_price * (1.0 - fee_rate)
                     cash += proceeds
                     pos_qty -= qty_to_sell
+                    cost_this_bar = abs(delta_value) - proceeds  # fee + slippage in $ (we receive less than fair value)
 
         # Update mark-to-market
         pos_value = pos_qty * price
@@ -330,6 +335,10 @@ def run_backtest(
             "pos_qty": pos_qty,
             "price": price,
             "exposure": curr_expo_final,
+            "desired_exposure_frac": desired_expo,
+            "applied_exposure": curr_expo_final,
+            "fee_slippage_this_bar": cost_this_bar,
+            "rebalanced": rebalanced,
         })
 
     equity_df = pd.DataFrame(equity_rows)
@@ -391,6 +400,7 @@ def main() -> Dict[str, Any]:
     Run backtest from env config.
 
     Env vars:
+        ARGUS_ENV_FILE: optional path to .env file (load first so SG_CORE_*, REGIME_* match geometry --env_file)
         ARGUS_STRATEGY_MODULE: e.g. "research.strategies.sg_core_exposure_v1"
         ARGUS_STRATEGY_FUNC: e.g. "generate_intent" (default)
         ARGUS_DATA_FILE: path to OHLCV CSV (default: flight_recorder.csv)
@@ -400,6 +410,23 @@ def main() -> Dict[str, Any]:
         ARGUS_SLIPPAGE_BPS: slippage in bps (default: 5)
     """
     argus_dir = _setup_path()
+
+    # Optional: load .env so strategy/regime params (SG_CORE_*, REGIME_*) match geometry.
+    # Use override=False so shell-set vars (e.g. ARGUS_FEE_BPS=0 for gross diff) take precedence.
+    env_file = os.environ.get("ARGUS_ENV_FILE", "").strip()
+    if env_file:
+        try:
+            from dotenv import load_dotenv
+            path = Path(env_file)
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            if path.exists():
+                load_dotenv(path, override=False)
+                print(f"Loaded env file: {path} (shell env takes precedence)")
+            else:
+                print(f"ARGUS_ENV_FILE set but file not found: {path}")
+        except ImportError:
+            print("ARGUS_ENV_FILE set but python-dotenv not installed; pip install python-dotenv")
 
     # Load config from env
     module_path = _env_str("ARGUS_STRATEGY_MODULE", "research.strategies.sg_core_exposure_v1")
@@ -479,6 +506,13 @@ def main() -> Dict[str, Any]:
         "next_bar_return": next_bar_return,
         "portfolio_return": portfolio_return,
         "equity": equity_df["equity"],
+        "equity_index": (equity_df["equity"].to_numpy(dtype=float) / initial_equity),
+        "desired_exposure_frac": equity_df["desired_exposure_frac"],
+        "applied_exposure": equity_df["applied_exposure"],
+        "bar_return_px": next_bar_return,
+        "bar_return_applied": portfolio_return,
+        "fee_slippage_this_bar": equity_df["fee_slippage_this_bar"],
+        "rebalanced": equity_df["rebalanced"],
     })
     trace_df.to_csv(trace_path, index=False)
     print(f"Trace written: {trace_path}")

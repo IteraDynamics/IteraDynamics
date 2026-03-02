@@ -13,6 +13,8 @@ Hard Locks:
 - Closed-bar determinism: decision at bar close t applies to return t -> t+1
 - Merge discipline: intersection join on timestamps, no forward-fill
 - Fees/slippage switch: default net ON (fee_bps=10, slippage_bps=5)
+- Cost regimes: retail_launch (120/10 bps), pro_target (10/5), institutional (2/2) for friction modeling.
+  Use --cost_regime to pick one; CLI --fee_bps/--slippage_bps override regime defaults when provided.
 
 Outputs:
 - One consolidated CSV: Scenario × Window rows with standardized metrics
@@ -42,10 +44,21 @@ except ImportError:
 # ---------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _RUNTIME_ARGUS = REPO_ROOT / "runtime" / "argus"
+_EXPERIMENTS = REPO_ROOT / "research" / "experiments"
 if str(_RUNTIME_ARGUS) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ARGUS))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(_EXPERIMENTS) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENTS))
+
+from cost_regimes import (
+    COST_REGIME_CUSTOM,
+    COST_REGIME_INSTITUTIONAL,
+    COST_REGIME_PRO_TARGET,
+    COST_REGIME_RETAIL_LAUNCH,
+    resolve_cost_params,
+)
 
 # ---------------------------------------------------------------------
 # Canonical windows (MUST match existing Itera reports)
@@ -78,6 +91,13 @@ SCENARIOS = [
 DEFAULT_FEE_BPS = 10
 DEFAULT_SLIPPAGE_BPS = 5
 
+# Alignment with harness backtest_runner (closed-bar t→t+1 semantics)
+# Harness first row = bar lookback (default 200); geometry core starts at CORE_MIN_BARS (100).
+# For BTC_CORE_ONLY trace we use BTC-only timeline and slice from (HARNESS_LOOKBACK - CORE_MIN_BARS)
+# so the first trace row matches the harness first row (same bar set, no merge/slicing mismatch).
+HARNESS_LOOKBACK = 200
+CORE_MIN_BARS = 100
+
 # ---------------------------------------------------------------------
 # Data (explicit paths only; no discovery/fallback)
 # ---------------------------------------------------------------------
@@ -101,12 +121,15 @@ class RunConfig:
     mode: str  # "net" or "gross"
     fee_bps: float
     slippage_bps: float
+    cost_regime: str  # retail_launch | pro_target | institutional | custom
     out_dir: Path
     out_csv: Path
     env_file: Optional[Path]  # optional .env path for deterministic Core params
     btc_data_file: Path
     eth_data_file: Path
     debug_trace_max_bars: Optional[int] = None  # limit timeline for fast trace (e.g. 2000)
+    initial_equity: float = 10000.0  # USD; geometry uses equity_index (1.0) internally, equity_usd = index * this
+    output_suffix: Optional[str] = None  # e.g. "retail_launch" for batch; used in manifest + trace paths
 
 
 # ---------------------------------------------------------------------
@@ -141,6 +164,38 @@ def _prep_closed_bars(df: pd.DataFrame) -> pd.DataFrame:
 
     # Drop last bar to enforce closed-bar only determinism
     df = df.iloc[:-1].reset_index(drop=True)
+    return df
+
+
+def _load_btc_for_harness_trace(btc_data_file: Path, *, lookback: int, max_trading_bars: Optional[int]) -> pd.DataFrame:
+    """
+    Load BTC for trace so the bar set and OHLCV format match the harness exactly.
+    Mirrors load_flight_recorder: no drop-last, require Open/High/Low/Close (numeric),
+    no duplicate-timestamp drop, cap at lookback + max_trading_bars.
+    Regime engine needs full OHLCV; otherwise classify_regime can fail or return CHOP.
+    """
+    raw = _read_price_csv_from_path(btc_data_file)
+    if "Timestamp" not in raw.columns:
+        raise ValueError("BTC CSV must contain Timestamp column")
+    for col in ("Open", "High", "Low", "Close"):
+        if col not in raw.columns:
+            raise ValueError(f"BTC CSV missing required OHLC column: {col}")
+    df = raw.copy()
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
+    for col in ("Open", "High", "Low", "Close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
+    if "Volume" in df.columns:
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+    else:
+        df["Volume"] = 0.0
+    if len(df) < lookback + 2:
+        raise ValueError(f"BTC has {len(df)} rows; need >= {lookback + 2} for trace")
+    if max_trading_bars is not None and max_trading_bars > 0:
+        cap = lookback + max_trading_bars
+        if len(df) > cap:
+            df = df.iloc[:cap].reset_index(drop=True)
     return df
 
 
@@ -215,28 +270,32 @@ def _extract_macro_bull(out: Dict) -> Optional[bool]:
     return bool(mb)
 
 
-def _compute_core_series(product_id: str, df_closed: pd.DataFrame) -> pd.DataFrame:
+def _compute_core_series(
+    product_id: str,
+    df_closed: pd.DataFrame,
+    *,
+    match_harness_bar_set: bool = False,
+) -> pd.DataFrame:
     """
     Uses existing Layer 1 + Layer 2 Core: research.strategies.sg_core_exposure_v2.generate_intent.
     Bar-by-bar with growing history through bar close t only (inclusive). Builds:
       - Timestamp (bar close time t)
       - x_core = desired_exposure_frac
       - for BTC only: btc_macro_is_bear = not meta["macro"]["macro_bull"] (required)
+
+    When match_harness_bar_set=True (trace only), skip drop_duplicates so row indices and
+    bar set match the harness (which does not drop duplicate timestamps).
     """
     generate_intent = _load_core_callable()
 
     if "Timestamp" not in df_closed.columns:
         raise ValueError("df_closed must have Timestamp column")
 
-    # Defensive cleaning (df_closed should already be prepped)
     df_closed = df_closed.copy()
     df_closed["Timestamp"] = pd.to_datetime(df_closed["Timestamp"], utc=True, errors="coerce")
-    df_closed = (
-        df_closed.dropna(subset=["Timestamp"])
-        .sort_values("Timestamp")
-        .drop_duplicates(subset=["Timestamp"], keep="last")
-        .reset_index(drop=True)
-    )
+    df_closed = df_closed.dropna(subset=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
+    if not match_harness_bar_set:
+        df_closed = df_closed.drop_duplicates(subset=["Timestamp"], keep="last").reset_index(drop=True)
 
     MIN_BARS = 100
     if len(df_closed) < (MIN_BARS + 2):
@@ -277,11 +336,9 @@ def _compute_core_series(product_id: str, df_closed: pd.DataFrame) -> pd.DataFra
 
     df = pd.DataFrame(records)
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
-    df = (
-        df.dropna(subset=["Timestamp"])
-        .sort_values("Timestamp")
-        .drop_duplicates(subset=["Timestamp"], keep="last")
-    )
+    df = df.dropna(subset=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
+    if not match_harness_bar_set:
+        df = df.drop_duplicates(subset=["Timestamp"], keep="last").reset_index(drop=True)
     df["x_core"] = pd.to_numeric(df["x_core"], errors="coerce").fillna(0.0)
 
     if "btc_macro_is_bear" in df.columns:
@@ -395,10 +452,14 @@ def _simulate(
     mode: str,
     fee_bps: float,
     slippage_bps: float,
+    initial_equity: float = 10000.0,
 ) -> pd.DataFrame:
     """
     Determinism:
     - weights computed at bar close t apply to return t -> t+1
+
+    Equity: normalized curve starts at 1.0 (equity_index). equity_usd = equity_index * initial_equity.
+    Metrics are computed on equity_index (scale-invariant); equity_usd is for display/cross-check with harness.
     """
     df = timeline_prices.copy()
     btc = df["btc_close"].to_numpy(dtype=float)
@@ -419,15 +480,16 @@ def _simulate(
 
     port_ret_net_next = port_ret_gross_next - cost_next
 
-    # Equity curve: E(t+1)=E(t)*(1+R_net_{t→t+1})
-    equity = np.full(len(df), np.nan, dtype=float)
-    equity[0] = 1.0
+    # Equity curve (normalized index starting at 1.0): E(t+1)=E(t)*(1+R_net_{t→t+1})
+    equity_index = np.full(len(df), np.nan, dtype=float)
+    equity_index[0] = 1.0
     for i in range(len(df) - 1):
         r = port_ret_net_next[i]
         if np.isnan(r):
-            equity[i + 1] = equity[i]
+            equity_index[i + 1] = equity_index[i]
         else:
-            equity[i + 1] = equity[i] * (1.0 + r)
+            equity_index[i + 1] = equity_index[i] * (1.0 + r)
+    equity_usd = equity_index * float(initial_equity)
 
     out = pd.DataFrame(
         {
@@ -444,7 +506,8 @@ def _simulate(
             "port_ret_gross_next": port_ret_gross_next,
             "cost_next": cost_next,
             "port_ret_net_next": port_ret_net_next,
-            "equity": equity,
+            "equity_index": equity_index,
+            "equity_usd": equity_usd,
         }
     )
     return out
@@ -452,6 +515,7 @@ def _simulate(
 
 # ---------------------------------------------------------------------
 # Metrics (standardized)
+# All metrics use equity_index (scale-invariant). equity_usd is for display/cross-check only.
 # ---------------------------------------------------------------------
 def _max_drawdown(equity: np.ndarray) -> float:
     peak = np.maximum.accumulate(equity)
@@ -532,7 +596,8 @@ def _compute_metrics(sim: pd.DataFrame, start: str, end: str) -> Dict[str, float
             "Turnover": float("nan"),
         }
 
-    eq = w["equity"].to_numpy(dtype=float)
+    # Metrics use equity_index (scale-invariant); no absolute-dollar metrics here
+    eq = w["equity_index"].to_numpy(dtype=float)
     rets = w["port_ret_net_next"].to_numpy(dtype=float)
 
     # Hourly bars: approximate periods/year = 365.25*24
@@ -630,26 +695,75 @@ def run(cfg: RunConfig) -> pd.DataFrame:
             mode=cfg.mode,
             fee_bps=cfg.fee_bps,
             slippage_bps=cfg.slippage_bps,
+            initial_equity=cfg.initial_equity,
         )
 
         # Per-bar trace export for BTC_CORE_ONLY (behavioral diff)
+        # ROOT CAUSE FIX: Harness does NOT drop the last bar and caps at lookback+DEBUG_TRACE_MAX_BARS.
+        # Geometry was using prepped btc (last bar dropped) and trim by merge last_ts, so bar set and
+        # row count differed. We now load BTC for the trace exactly like the harness (no drop last,
+        # cap at lookback+debug_trace_max_bars), compute core from that, then slice so first row = bar 200.
         if scenario == "BTC_CORE_ONLY":
             debug_dir = REPO_ROOT / "debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
-            trace_path = debug_dir / "geometry_btc_trace.csv"
+            _trace_suffix = f"__{cfg.output_suffix}" if cfg.output_suffix else ""
+            trace_path = debug_dir / f"geometry_btc_trace{_trace_suffix}.csv"
+            btc_trace = _load_btc_for_harness_trace(
+                cfg.btc_data_file,
+                lookback=HARNESS_LOOKBACK,
+                max_trading_bars=cfg.debug_trace_max_bars,
+            )
+            btc_core_trace = _compute_core_series(
+                "BTC-USD", btc_trace, match_harness_bar_set=True
+            )
+            timeline_btc_only = btc_trace[["Timestamp", "Close"]].copy()
+            timeline_btc_only["btc_close"] = timeline_btc_only["Close"].astype(float)
+            timeline_btc_only["eth_close"] = timeline_btc_only["Close"].astype(float)
+            btc_core_cols = ["x_core"] + (["btc_macro_is_bear"] if "btc_macro_is_bear" in btc_core_trace.columns else [])
+            timeline_btc_aligned, btc_core_btc_aligned = _align_series_to_timeline(
+                timeline_btc_only, btc_core_trace, cols=btc_core_cols
+            )
+            x_btc_trace = btc_core_btc_aligned["x_core"].to_numpy(dtype=float)
+            w_eth_trace = np.zeros(len(x_btc_trace), dtype=float)
+            w_cash_trace = 1.0 - x_btc_trace
+            sim_trace = _simulate(
+                timeline_prices=timeline_btc_aligned,
+                w_btc_t=x_btc_trace,
+                w_eth_t=w_eth_trace,
+                w_cash_t=w_cash_trace,
+                mode=cfg.mode,
+                fee_bps=cfg.fee_bps,
+                slippage_bps=cfg.slippage_bps,
+                initial_equity=cfg.initial_equity,
+            )
+            trace_skip = HARNESS_LOOKBACK - CORE_MIN_BARS
+            sim_trace = sim_trace.iloc[trace_skip:].reset_index(drop=True)
+            # desired_exposure_frac: from strategy (for BTC_CORE_ONLY = w_btc = gross_exposure)
             trace_df = pd.DataFrame({
-                "timestamp": sim["Timestamp"],
-                "close_price": sim["btc_close"],
-                "exposure": sim["gross_exposure"],
-                "next_bar_return": sim["r_btc_next"],
-                "portfolio_return": sim["port_ret_net_next"],
-                "equity": sim["equity"],
+                "timestamp": sim_trace["Timestamp"],
+                "close_price": sim_trace["btc_close"],
+                "exposure": sim_trace["gross_exposure"],
+                "next_bar_return": sim_trace["r_btc_next"],
+                "portfolio_return": sim_trace["port_ret_net_next"],
+                "equity_index": sim_trace["equity_index"],
+                "equity_usd": sim_trace["equity_usd"],
+                "desired_exposure_frac": sim_trace["w_btc"],
+                "applied_exposure": sim_trace["gross_exposure"],
+                "bar_return_px": sim_trace["r_btc_next"],
+                "bar_return_applied": sim_trace["port_ret_net_next"],
+                "fee_slippage_this_bar": sim_trace["cost_next"],
+                "rebalanced": (sim_trace["turnover"].to_numpy(dtype=float) > 1e-9),
             })
+            trace_df["cost_regime"] = cfg.cost_regime
             trace_df.to_csv(trace_path, index=False)
-            print(f"Trace written: {trace_path}")
+            print(f"Trace written: {trace_path} ({len(trace_df)} rows, BTC loaded like harness: no drop-last, cap lookback+N)")
 
         for window_name, start, end in WINDOWS:
             m = _compute_metrics(sim, start=start, end=end)
+            # Final equity (USD) at end of window for cross-check with harness
+            ts = pd.to_datetime(sim["Timestamp"], utc=True)
+            w = sim[(ts >= pd.Timestamp(start, tz="UTC")) & (ts <= pd.Timestamp(end, tz="UTC"))]
+            final_equity_usd = float(w["equity_usd"].iloc[-1]) if len(w) > 0 else float("nan")
 
             # Include crash-window DD and post-crash CAGR in appropriate window rows
             crash_window_dd = m["MaxDD"] if window_name == "crash_window" else float("nan")
@@ -659,6 +773,7 @@ def run(cfg: RunConfig) -> pd.DataFrame:
                 {
                     "scenario": scenario,
                     "window": window_name,
+                    "cost_regime": cfg.cost_regime,
                     "start": start,
                     "end": end,
                     "mode": cfg.mode,
@@ -674,6 +789,7 @@ def run(cfg: RunConfig) -> pd.DataFrame:
                     "Turnover": m["Turnover"],
                     "CrashWindowDD": crash_window_dd,
                     "PostCrashCAGR": post_crash_cagr,
+                    "final_equity_usd": final_equity_usd,
                 }
             )
 
@@ -683,14 +799,17 @@ def run(cfg: RunConfig) -> pd.DataFrame:
     out.to_csv(cfg.out_csv, index=False)
 
     # Run manifest for audit
-    manifest_path = cfg.out_dir / "portfolio_geometry_run_manifest.json"
+    _manifest_suffix = f"__{cfg.output_suffix}" if cfg.output_suffix else ""
+    manifest_path = cfg.out_dir / f"portfolio_geometry_run_manifest{_manifest_suffix}.json"
     manifest = {
+        "cost_regime": cfg.cost_regime,
         "env_file": str(cfg.env_file) if cfg.env_file is not None else None,
         "btc_data_file": str(cfg.btc_data_file),
         "eth_data_file": str(cfg.eth_data_file),
         "fee_bps": cfg.fee_bps,
         "slippage_bps": cfg.slippage_bps,
         "mode": cfg.mode,
+        "initial_equity": cfg.initial_equity,
         "resolved_core_params": resolved_params,
     }
     with open(manifest_path, "w") as f:
@@ -705,20 +824,45 @@ def run(cfg: RunConfig) -> pd.DataFrame:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Portfolio geometry validation. Use --cost_regime for retail/pro/institutional friction; --run_all_cost_regimes runs all three."
+    )
     ap.add_argument("--mode", choices=["net", "gross"], default="net", help="net includes fees+slippage; gross disables costs")
     ap.add_argument("--env_file", type=str, default=None, help="Optional .env path for deterministic Core params (load_dotenv with override=True)")
     ap.add_argument("--btc_data_file", type=str, required=True, help="Path to BTC price CSV (mandatory)")
     ap.add_argument("--eth_data_file", type=str, required=True, help="Path to ETH price CSV (mandatory)")
-    ap.add_argument("--fee_bps", type=float, default=DEFAULT_FEE_BPS)
-    ap.add_argument("--slippage_bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
+    ap.add_argument(
+        "--cost_regime",
+        choices=[COST_REGIME_RETAIL_LAUNCH, COST_REGIME_PRO_TARGET, COST_REGIME_INSTITUTIONAL, COST_REGIME_CUSTOM],
+        default=COST_REGIME_CUSTOM,
+        help="Cost regime: retail_launch (120/10 bps), pro_target (10/5), institutional (2/2), or custom (use --fee_bps/--slippage_bps or defaults 10/5). CLI --fee_bps/--slippage_bps override regime defaults.",
+    )
+    ap.add_argument(
+        "--fee_bps",
+        type=float,
+        default=None,
+        help="Fee in bps (overrides cost_regime default when set). With cost_regime=custom, defaults to 10.",
+    )
+    ap.add_argument(
+        "--slippage_bps",
+        type=float,
+        default=None,
+        help="Slippage in bps (overrides cost_regime default when set). With cost_regime=custom, defaults to 5.",
+    )
     ap.add_argument("--out_dir", type=str, default=str(REPO_ROOT / "research" / "experiments" / "output"))
     ap.add_argument(
         "--out_csv",
         type=str,
         default=str(REPO_ROOT / "research" / "experiments" / "output" / "portfolio_geometry_validation.csv"),
+        help="Output CSV path; ignored when --run_all_cost_regimes (paths get regime suffix).",
     )
     ap.add_argument("--debug_trace_max_bars", type=int, default=None, help="Limit timeline to N bars for fast trace (e.g. 2000)")
+    ap.add_argument("--initial_equity", type=float, default=10000.0, help="Initial equity in USD; equity_usd = equity_index * this (default 10000)")
+    ap.add_argument(
+        "--run_all_cost_regimes",
+        action="store_true",
+        help="Run experiment 3 times (retail_launch, pro_target, institutional) with distinct output files; print BTC_CORE_ONLY full_cycle summary table.",
+    )
     args = ap.parse_args()
 
     # Resolve paths (allow relative to cwd or repo root)
@@ -733,35 +877,117 @@ def main():
     if not eth_path.exists():
         raise ValueError(f"ETH data file not found: {eth_path}")
 
-    env_file_path: Optional[Path] = None
-    if args.env_file is not None:
-        env_file_path = Path(args.env_file)
-        if not env_file_path.is_absolute():
-            env_file_path = (REPO_ROOT / args.env_file).resolve()
-        if not env_file_path.exists():
-            raise ValueError(f"Env file not found: {env_file_path}")
-        if load_dotenv is None:
-            raise ValueError("dotenv is not installed; pip install python-dotenv to use --env_file")
-        load_dotenv(env_file_path, override=True)
-        print(f"Loaded env file: {env_file_path}")
-    else:
+    env_file_path = _resolve_env_file(args.env_file)
+    if env_file_path is None:
         print("No env file provided — using current process environment")
 
     if os.environ.get("ARGUS_FEE_BPS") is not None or os.environ.get("ARGUS_SLIPPAGE_BPS") is not None:
-        print("NOTE: Ignoring ARGUS_FEE_BPS / ARGUS_SLIPPAGE_BPS env vars. Using CLI fee/slippage values.")
+        print("NOTE: Ignoring ARGUS_FEE_BPS / ARGUS_SLIPPAGE_BPS env vars. Using CLI/cost_regime fee/slippage values.")
+
+    if args.run_all_cost_regimes:
+        _run_all_cost_regimes(args, btc_path, eth_path, env_file_path)
+        return
+
+    fee_bps, slippage_bps = resolve_cost_params(
+        cost_regime=args.cost_regime,
+        fee_bps_cli=args.fee_bps,
+        slippage_bps_cli=args.slippage_bps,
+        custom_fee_bps=DEFAULT_FEE_BPS,
+        custom_slippage_bps=DEFAULT_SLIPPAGE_BPS,
+    )
+    out_dir = Path(args.out_dir)
+    out_csv = Path(args.out_csv)
 
     cfg = RunConfig(
         mode=args.mode,
-        fee_bps=float(args.fee_bps),
-        slippage_bps=float(args.slippage_bps),
-        out_dir=Path(args.out_dir),
-        out_csv=Path(args.out_csv),
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        cost_regime=args.cost_regime,
+        out_dir=out_dir,
+        out_csv=out_csv,
         env_file=env_file_path,
         btc_data_file=btc_path,
         eth_data_file=eth_path,
         debug_trace_max_bars=args.debug_trace_max_bars,
+        initial_equity=float(args.initial_equity),
+        output_suffix=None,
     )
     run(cfg)
+
+
+def _resolve_env_file(env_file_arg: Optional[str]) -> Optional[Path]:
+    if env_file_arg is None:
+        return None
+    env_file_path = Path(env_file_arg)
+    if not env_file_path.is_absolute():
+        env_file_path = (REPO_ROOT / env_file_arg).resolve()
+    if not env_file_path.exists():
+        raise ValueError(f"Env file not found: {env_file_path}")
+    if load_dotenv is None:
+        raise ValueError("dotenv is not installed; pip install python-dotenv to use --env_file")
+    load_dotenv(env_file_path, override=True)
+    print(f"Loaded env file: {env_file_path}")
+    return env_file_path
+
+
+def _run_all_cost_regimes(
+    args: argparse.Namespace,
+    btc_path: Path,
+    eth_path: Path,
+    env_file_path: Optional[Path],
+) -> None:
+    """Run experiment for retail_launch, pro_target, institutional; distinct outputs; print summary table."""
+    regimes = [COST_REGIME_RETAIL_LAUNCH, COST_REGIME_PRO_TARGET, COST_REGIME_INSTITUTIONAL]
+    out_dir = Path(args.out_dir)
+    base_csv = Path(args.out_csv)
+    # e.g. output/portfolio_geometry_validation__retail_launch.csv
+    base_stem = base_csv.stem
+    base_parent = base_csv.parent
+
+    summary_rows = []
+    for cost_regime in regimes:
+        fee_bps, slippage_bps = resolve_cost_params(
+            cost_regime=cost_regime,
+            fee_bps_cli=None,
+            slippage_bps_cli=None,
+        )
+        out_csv = base_parent / f"{base_stem}__{cost_regime}.csv"
+        cfg = RunConfig(
+            mode=args.mode,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            cost_regime=cost_regime,
+            out_dir=out_dir,
+            out_csv=out_csv,
+            env_file=env_file_path,
+            btc_data_file=btc_path,
+            eth_data_file=eth_path,
+            debug_trace_max_bars=args.debug_trace_max_bars,
+            initial_equity=float(args.initial_equity),
+            output_suffix=cost_regime,
+        )
+        print(f"\n{'='*60}\nCost regime: {cost_regime} (fee_bps={fee_bps}, slippage_bps={slippage_bps})\n{'='*60}")
+        out = run(cfg)
+        # BTC_CORE_ONLY full_cycle row for summary
+        subset = out[(out["scenario"] == "BTC_CORE_ONLY") & (out["window"] == "full_cycle")]
+        if len(subset) == 1:
+            row = subset.iloc[0]
+            summary_rows.append({
+                "cost_regime": cost_regime,
+                "CAGR": row["CAGR"],
+                "MaxDD": row["MaxDD"],
+                "Calmar": row["Calmar"],
+                "final_equity_usd": row["final_equity_usd"],
+            })
+
+    if summary_rows:
+        print("\n" + "=" * 60)
+        print("BTC_CORE_ONLY full_cycle — cost regime summary")
+        print("=" * 60)
+        summary_df = pd.DataFrame(summary_rows)
+        with pd.option_context("display.max_columns", None, "display.width", 120):
+            print(summary_df.to_string(index=False))
+        print("=" * 60)
 
 
 if __name__ == "__main__":
