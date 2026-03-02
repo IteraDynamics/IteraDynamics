@@ -13,9 +13,14 @@
 
 **Itera Dynamics** is a quantitative trading platform built around a modular, asset-agnostic architecture. The system separates signal generation from execution, allowing the same core intelligence to power multiple market deployments.
 
-### Current Focus: BTC Trading via Argus
+### Current Focus: Argus (BTC & Multi-Asset)
 
-The platform currently operates **Argus**, an hourly BTC trading system running against Coinbase. Future expansion to securities (stocks, ETFs) is architected but dormant.
+The platform operates **Argus**, an hourly trading system that supports:
+
+- **Single-product mode**: One asset (default **BTC-USD**) via `run_live.py`, with optional **ETH-USD** via `ARGUS_PRODUCT_ID`.
+- **Portfolio mode**: Multi-asset (e.g. BTC-USD + ETH-USD) via `run_portfolio_live.py` and the research portfolio allocator.
+
+Execution is against **Coinbase**. Future expansion to securities (stocks, ETFs) is architected in **Alpha Engine** but dormant.
 
 ---
 
@@ -29,25 +34,27 @@ The platform currently operates **Argus**, an hourly BTC trading system running 
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │    ┌─────────────────────────────────────────┐                      │
-│    │       APEX CORTEX (apex_core/)          │                      │
-│    │       The Brain - Signal Logic          │                      │
-│    │  • ML inference & backtesting           │                      │
-│    │  • Regime detection                     │                      │
-│    │  • Governance & drift monitoring        │                      │
+│    │     APEX CORTEX (runtime/argus/apex_core/)                     │
+│    │     Signal logic, governors, execution                         │
+│    │  • signal_generator.py — single-asset (Layer 3)                │
+│    │  • portfolio_signal_generator.py — multi-asset                 │
+│    │  • exit_watcher.py — 5‑min early exit / min-hold               │
+│    │  • strategy_router.py — external strategy loading               │
 │    └──────────────┬──────────────────────────┘                      │
 │                   │                                                 │
 │         ┌─────────┴─────────┐                                       │
 │         ▼                   ▼                                       │
 │    ┌─────────┐        ┌─────────────┐                               │
 │    │  ARGUS  │        │ AlphaEngine │                               │
-│    │  (BTC)  │        │ (Securities)│                               │
+│    │ BTC/ETH │        │ (Securities)│                               │
 │    │ ACTIVE  │        │   DORMANT   │                               │
 │    └─────────┘        └─────────────┘                               │
 │                                                                     │
 │    ┌─────────────────────────────────────────┐                      │
-│    │            RESEARCH LAB                 │                      │
-│    │    Strategy development & backtesting   │                      │
-│    └─────────────────────────────────────────┘                      │
+│    │            RESEARCH (repo root)         │                       │
+│    │  Backtest engine, strategies, configs,  │                       │
+│    │  portfolio allocator, experiments       │                       │
+│    └─────────────────────────────────────────┘                       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -59,34 +66,35 @@ The Argus runtime implements a clean 3-layer architecture for strategy execution
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    LAYER 3: SG Execution                            │
-│         (signal_generator.py — wallet, notional, DD governors)      │
-│              ↑ Receives intent, applies safety gates, executes      │
+│    (signal_generator.py — wallet, notional, DD governors)          │
+│              ↑ Receives intent, applies safety gates, executes     │
 │              │ Maps: ENTER_LONG→BUY, EXIT_LONG→SELL, HOLD→HOLD      │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↑
-                           Strategy Intent
+                           Strategy Intent (dict → StrategyIntent)
                                     │
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    LAYER 2: Strategies                              │
 │                (pluggable, deterministic alpha modules)             │
-│     generate_intent(df, ctx) → {action, confidence, meta, ...}      │
+│     generate_intent(df, ctx, *, closed_only=True) → dict            │
 │              ↑ Uses regime classification for entry/exit            │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↑
                              RegimeState
                                     │
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    LAYER 1: Regime Engine                           │
-│            (authoritative, stable, shared classification)           │
-│      classify_regime(df) → RegimeState{label, confidence, ...}      │
+│                    LAYER 1: Regime Engine                            │
+│         (runtime/argus/research/regime/regime_engine.py)             │
+│      classify_regime(df, closed_only=True) → RegimeState            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key Principles:**
-- **Layer 1** is authoritative — all strategies share the same regime classification
-- **Layer 2** strategies are deterministic — same input → same output, no side effects
-- **Layer 3** (SG) is the only component that touches broker, wallet, files, or state
-- **Timeline Safety**: `closed_only=True` ensures decisions use closed candles only
+
+- **Layer 1** is authoritative — all strategies share the same regime classification.
+- **Layer 2** strategies are deterministic — same input → same output, no side effects.
+- **Layer 3** (SG) is the only component that touches broker, wallet, files, or state.
+- **Timeline Safety**: `closed_only=True` ensures decisions use closed candles only.
 
 ---
 
@@ -95,59 +103,85 @@ The Argus runtime implements a clean 3-layer architecture for strategy execution
 ```
 IteraDynamics_Mono/
 │
-├── runtime/                      # 🦅 LIVE EXECUTION
-│   └── argus/                    # BTC trading service
-│       ├── apex_core/            # Signal generation
-│       │   └── signal_generator.py  # Layer 3: execution + governors
+├── runtime/                          # 🦅 LIVE EXECUTION
+│   └── argus/                        # BTC/ETH trading service
+│       ├── apex_core/                # Signal & execution
+│       │   ├── signal_generator.py   # Layer 3: single-asset execution + governors
+│       │   ├── portfolio_signal_generator.py  # Multi-asset portfolio execution
+│       │   ├── strategy_router.py    # Load strategy from ARGUS_STRATEGY_MODULE/FUNC
+│       │   ├── strategy_intent.py    # Intent/Action types (optional path)
+│       │   └── exit_watcher.py       # 5‑min early exit & min-hold checks
 │       │
-│       ├── research/             # 3-LAYER STRATEGY ARCHITECTURE
-│       │   ├── __init__.py
-│       │   │
-│       │   ├── regime/           # LAYER 1: Regime Engine
+│       ├── research/                 # 3-LAYER STRATEGY ARCHITECTURE
+│       │   ├── regime/               # LAYER 1: Regime Engine
 │       │   │   ├── __init__.py
 │       │   │   └── regime_engine.py
 │       │   │
-│       │   ├── strategies/       # LAYER 2: Strategy Modules
-│       │   │   ├── __init__.py
-│       │   │   ├── sg_regime_trend_v1.py    # Original trend strategy
-│       │   │   ├── sg_core_exposure_v1.py   # Volatility-scaled core
-│       │   │   ├── sg_trend_probe_v1.py     # Trend probe (TREND_UP only)
-│       │   │   ├── sg_vol_probe_v1.py       # Vol compression breakout
-│       │   │   └── sg_stub_strategy.py      # Testing stub
+│       │   ├── strategies/           # LAYER 2: Strategy Modules
+│       │   │   ├── sg_regime_trend_v1.py
+│       │   │   ├── sg_core_exposure_v1.py
+│       │   │   ├── sg_core_exposure_v2.py
+│       │   │   ├── sg_trend_probe_v1.py
+│       │   │   ├── sg_vol_probe_v1.py
+│       │   │   ├── sg_compression_shot_v1.py
+│       │   │   ├── sg_compression_shot_v2.py
+│       │   │   ├── sg_compression_shot_v3.py
+│       │   │   └── sg_stub_strategy.py
 │       │   │
-│       │   └── harness/          # Smoke tests & validation
-│       │       ├── __init__.py
-│       │       ├── regime_smoke.py
-│       │       └── strategy_smoke.py
+│       │   ├── harness/              # Smoke tests & backtest runner
+│       │   │   ├── regime_smoke.py
+│       │   │   ├── strategy_smoke.py
+│       │   │   ├── backtest_smoke.py
+│       │   │   └── backtest_runner.py
+│       │   │
+│       │   ├── diagnostics/
+│       │   │   └── crash_window_report.py
+│       │   └── results/             # Strategy run artifacts
 │       │
 │       ├── src/
-│       │   └── real_broker.py    # Coinbase API integration
+│       │   └── real_broker.py        # Coinbase API integration
 │       │
-│       ├── models/               # Trained ML models
-│       │   └── random_forest.pkl
+│       ├── models/                   # Trained ML models & params
+│       │   ├── random_forest.pkl
+│       │   ├── governance_params.json
+│       │   ├── paper_trading_params.json
+│       │   └── ml_hyperparameters.json
 │       │
-│       ├── run_live.py           # Hourly scheduler (main entry)
-│       ├── dashboard.py          # Streamlit dashboard
-│       ├── cortex.json           # Runtime state/decision log
-│       ├── flight_recorder.csv   # OHLCV data
-│       ├── prime_state.json      # Live position state
-│       └── paper_prime_state.json # Paper trading state
+│       ├── config.py                 # Product ID, namespaced paths (ARGUS_PRODUCT_ID)
+│       ├── run_live.py               # Hourly scheduler (single product)
+│       ├── run_portfolio_live.py     # Portfolio orchestrator (multi-asset)
+│       ├── sweep_multi_product.py    # Multi-product config/path checks
+│       ├── test_execution.py        # Pre-deployment test suite
+│       ├── dashboard.py             # Streamlit dashboard (run from here)
+│       ├── cortex.json / cortex_<slug>.json
+│       ├── prime_state.json / paper_prime_state.json (or _<slug>)
+│       ├── trade_state.json / trade_ledger.jsonl (or _<slug>)
+│       ├── flight_recorder*.csv
+│       ├── portfolio_state.json     # Portfolio mode state
+│       ├── MULTI_PRODUCT.md         # Multi-product (BTC/ETH) guide
+│       ├── argus-eth.env.example
+│       └── argus-eth.service.example
 │
-├── research/                     # 🔬 STRATEGY R&D (repo root)
-│   ├── strategies/               # Backtest-focused strategies
-│   ├── engine/                   # Backtest engine
-│   ├── backtest/                 # Backtest utilities
-│   ├── experiments/              # One-off experiments
-│   └── backtests/                # Results & artifacts
+├── research/                         # 🔬 STRATEGY R&D (repo root)
+│   ├── configs/                      # Strategy/env configs
+│   │   └── core_v2/                  # e.g. btc_core_v2_tuned_*.env
+│   ├── portfolio/                    # Cross-asset allocator (portfolio mode)
+│   │   └── cross_asset_allocator.py
+│   ├── regime/                       # Repo-root regime (portfolio mode)
+│   │   └── classify_regime.py
+│   ├── strategies/                   # Backtest-focused strategies
+│   ├── engine/                       # Backtest engine
+│   ├── backtest/                     # Backtest utilities
+│   ├── experiments/                  # One-off experiments
+│   ├── backtests/                    # Results & artifacts
+│   └── STRATEGY_SUMMARY.md
 │
-├── apex_core/                    # 🧠 Asset-agnostic signal engine
-├── alpha_engine/                 # 📈 Securities platform (Dormant)
-├── moonwire/                     # 🌙 Alternative execution engine
-├── scripts/                      # 🛠️ Utilities
-├── data/                         # 📊 Historical data
-├── output/                       # 📁 Backtest results
+├── alpha_engine/                     # 📈 Securities platform (Dormant)
+├── moonwire/                         # 🌙 Alternative execution engine
+├── scripts/                          # 🛠️ Data, training, debug
+├── data/                             # 📊 Historical data
+├── output/                           # 📁 Backtest results
 │
-├── dashboard.py                  # Mission Control (Streamlit)
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md
@@ -164,6 +198,7 @@ The regime engine provides authoritative market state classification shared by a
 **Location:** `runtime/argus/research/regime/regime_engine.py`
 
 **API:**
+
 ```python
 from research.regime import classify_regime, RegimeState, RegimeLabel
 
@@ -175,27 +210,28 @@ regime = classify_regime(df, closed_only=True)
 ```
 
 **Regime Labels (Priority Order):**
-| Priority | Label | Description |
-|----------|-------|-------------|
-| 1 | PANIC | Extreme volatility + high volume |
-| 2 | VOL_EXPANSION | ATR% above threshold |
-| 3 | VOL_COMPRESSION | ATR% below threshold |
-| 4 | TREND_UP | EMA fast > slow + trend strength |
-| 5 | TREND_DOWN | EMA fast < slow + trend strength |
-| 6 | CHOP | Default / no clear signal |
+
+| Priority | Label            | Description                          |
+|----------|------------------|--------------------------------------|
+| 1        | PANIC            | Extreme volatility + high volume    |
+| 2        | VOL_EXPANSION    | ATR% above threshold                 |
+| 3        | VOL_COMPRESSION  | ATR% below threshold                 |
+| 4        | TREND_UP         | EMA fast > slow + trend strength     |
+| 5        | TREND_DOWN       | EMA fast < slow + trend strength     |
+| 6        | CHOP             | Default / no clear signal            |
 
 ### Layer 2: Strategy Modules
 
-All strategies implement the same interface:
+Strategies implement a single entrypoint and return a **dict** that the signal generator converts to `StrategyIntent`:
 
 ```python
-def generate_intent(df: pd.DataFrame, ctx: Any, *, closed_only: bool = True) -> dict:
+def generate_intent(df: pd.DataFrame, ctx: dict, *, closed_only: bool = True) -> dict:
     """
     Returns:
         {
             "action": "ENTER_LONG" | "EXIT_LONG" | "HOLD" | "FLAT",
-            "confidence": float,  # 0-1
-            "desired_exposure_frac": float,  # 0-1
+            "confidence": float,           # 0-1
+            "desired_exposure_frac": float,# 0-1
             "horizon_hours": int,
             "reason": str,
             "meta": dict
@@ -205,28 +241,60 @@ def generate_intent(df: pd.DataFrame, ctx: Any, *, closed_only: bool = True) -> 
 
 **Available Strategies:**
 
-| Strategy | File | Description |
-|----------|------|-------------|
-| **Regime Trend v1** | `sg_regime_trend_v1.py` | Original trend-following with ADX gate |
-| **Core Exposure v1** | `sg_core_exposure_v1.py` | Volatility-scaled exposure by regime |
-| **Trend Probe v1** | `sg_trend_probe_v1.py` | TREND_UP only, strict trend following |
-| **Vol Probe v1** | `sg_vol_probe_v1.py` | VOL_COMPRESSION breakout hunting |
-| **Stub** | `sg_stub_strategy.py` | Testing stub (always HOLD) |
+| Strategy              | File                    | Description                              |
+|-----------------------|-------------------------|------------------------------------------|
+| **Regime Trend v1**   | `sg_regime_trend_v1.py` | Trend-following with ADX gate            |
+| **Core Exposure v1** | `sg_core_exposure_v1.py`| Volatility-scaled exposure by regime     |
+| **Core Exposure v2**  | `sg_core_exposure_v2.py`| Core v1 + macro filter / tuning          |
+| **Trend Probe v1**    | `sg_trend_probe_v1.py` | TREND_UP only, strict trend following    |
+| **Vol Probe v1**      | `sg_vol_probe_v1.py`   | VOL_COMPRESSION breakout                 |
+| **Compression Shot v1–v3** | `sg_compression_shot_v*.py` | Vol compression breakout variants |
+| **Stub**              | `sg_stub_strategy.py`  | Testing stub (always HOLD)               |
 
 ### Layer 3: Signal Generator (Execution)
 
-The signal generator (`signal_generator.py`) is the execution layer that:
-- Loads external strategies via environment variables
-- Applies safety gates (wallet, notional, drawdown governors)
+The signal generator (`apex_core/signal_generator.py`) is the execution layer that:
+
+- Loads the external strategy via `ARGUS_STRATEGY_MODULE` / `ARGUS_STRATEGY_FUNC`
+- Applies safety gates (wallet, notional, drawdown governors, min-hold, reentry cooldown)
 - Maps intents to trades: `ENTER_LONG→BUY`, `EXIT_LONG→SELL`
 - Manages position state and horizon exits
-- Writes to `cortex.json` and state files
+- Writes to `cortex.json` (or namespaced `cortex_<slug>.json`) and state files
 
-**External Strategy Loading:**
+**External strategy (single-asset):**
+
 ```bash
 ARGUS_STRATEGY_MODULE="research.strategies.sg_core_exposure_v1"
 ARGUS_STRATEGY_FUNC="generate_intent"
 ```
+
+**Exit watcher** (`apex_core/exit_watcher.py`): Optional 5‑minute check for early exit (profit hurdle) and min-hold enforcement. See env vars `ARGUS_EARLY_EXIT_ENABLED`, `ARGUS_EARLY_EXIT_MIN_HOURS`, `ARGUS_EARLY_EXIT_PROFIT_PCT`.
+
+---
+
+## Multi-Product (BTC-USD / ETH-USD)
+
+Argus can run **two independent instances** (e.g. BTC-USD and ETH-USD) with no shared state. Each instance uses **namespaced files** so they do not overwrite each other.
+
+| Variable           | Default   | Description                                      |
+|--------------------|-----------|--------------------------------------------------|
+| `ARGUS_PRODUCT_ID` | `BTC-USD` | Coinbase product (e.g. `BTC-USD`, `ETH-USD`).   |
+
+When `ARGUS_PRODUCT_ID` is not set or is `BTC-USD`, legacy filenames are used. For other products (e.g. `ETH-USD`), files are namespaced: `flight_recorder_eth_usd.csv`, `prime_state_eth_usd.json`, `trade_ledger_eth_usd.jsonl`, `cortex_eth_usd.json`, etc.
+
+See **`runtime/argus/MULTI_PRODUCT.md`** for full details, and use **`sweep_multi_product.py`** (no broker) or **`test_execution.py`** (with API keys) to verify config and paths.
+
+---
+
+## Portfolio Mode (Multi-Asset)
+
+For a single process trading multiple products with a shared allocation policy:
+
+- **Entrypoint:** `runtime/argus/run_portfolio_live.py`
+- **Allocator:** `research/portfolio/cross_asset_allocator.py` (deterministic, closed-bar only)
+- **Env:** `ARGUS_PORTFOLIO_PRODUCTS=BTC-USD,ETH-USD` (required). Optional: `PORTFOLIO_MAX_GROSS_EXPOSURE`, `PORTFOLIO_MAX_WEIGHT_PER_ASSET`, `PORTFOLIO_MIN_WEIGHT_PER_ASSET`, `PORTFOLIO_ALLOW_CASH`.
+
+State is stored in `portfolio_state.json`; per-product state/ledgers remain namespaced as in multi-product.
 
 ---
 
@@ -235,11 +303,12 @@ ARGUS_STRATEGY_FUNC="generate_intent"
 **All decisions are based on CLOSED candles only.**
 
 When `closed_only=True` (default):
-1. The **last row is ALWAYS dropped** before computing indicators
-2. `meta.closed_only` and `meta.dropped_last_row` flags are set
-3. `asof_ts` is derived from the last **included** (closed) row
 
-This prevents lookahead bias in backtesting and ensures live trading decisions don't rely on potentially-forming candles.
+1. The **last row is dropped** before computing indicators.
+2. `meta.closed_only` and `meta.dropped_last_row` are set.
+3. `asof_ts` is derived from the last **included** (closed) row.
+
+This prevents lookahead bias in backtesting and ensures live decisions do not rely on the current forming candle.
 
 ---
 
@@ -248,17 +317,19 @@ This prevents lookahead bias in backtesting and ensures live trading decisions d
 ### 1. Installation
 
 ```bash
-git clone https://github.com/IteraDynamics/IteraDynamics.git
+git clone https://github.com/IteraDynamics/IteraDynamics_Mono.git
 cd IteraDynamics_Mono
 pip install -e .
+pip install -r requirements.txt
 ```
 
 ### 2. Run Smoke Tests (Safe, No Broker)
 
+From repo root:
+
 ```powershell
 cd "C:\Users\admin\OneDrive\Desktop\Desktop\IteraDynamics_Mono"
 
-# Run both tests in one Python session
 python -c "
 import sys
 sys.path.insert(0, r'./runtime/argus')
@@ -271,7 +342,7 @@ strategy_test()
 
 ### 3. Run Live Trading (Argus) — Dry Run
 
-Configure your Coinbase API credentials in `.env`:
+Configure Coinbase in `runtime/argus/.env` (or env):
 
 ```env
 COINBASE_API_KEY=your_key
@@ -279,22 +350,20 @@ COINBASE_API_SECRET=your_secret
 COINBASE_PORTFOLIO_UUID=your_portfolio_uuid
 ```
 
-Start in **dry-run mode** (paper trading):
+Single-asset, **dry-run** (paper):
 
 ```powershell
-cd "C:\Users\admin\OneDrive\Desktop\Desktop\IteraDynamics_Mono"
+cd runtime/argus
 
-# Set safety flags
 $env:PRIME_DRY_RUN = "1"
 $env:ARGUS_MODE = "prime"
-
-# Use external strategy
 $env:ARGUS_STRATEGY_MODULE = "research.strategies.sg_core_exposure_v1"
 $env:ARGUS_STRATEGY_FUNC = "generate_intent"
 
-# Run once
-python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from apex_core.signal_generator import generate_signals; generate_signals()"
+python -c "from apex_core.signal_generator import generate_signals; generate_signals()"
 ```
+
+Optional: set `ARGUS_PRODUCT_ID=ETH-USD` to run the ETH instance with namespaced files.
 
 ### 4. Launch Dashboard
 
@@ -303,43 +372,82 @@ cd runtime/argus
 python -m streamlit run dashboard.py
 ```
 
+For a second product (e.g. ETH), use a different port: `streamlit run dashboard.py --server.port 8502` with `ARGUS_PRODUCT_ID=ETH-USD` set.
+
 ---
 
 ## Environment Variables
 
 ### Safety / Mode
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PRIME_DRY_RUN` | `0` | Set to `1` for paper trading |
-| `ARGUS_DRY_RUN` | `0` | Alternate dry-run flag |
-| `ARGUS_MODE` | `legacy` | Set to `prime` for Prime engine |
 
-### External Strategy
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `ARGUS_STRATEGY_MODULE` | `research.strategies.sg_core_exposure_v1` | Module path |
-| `ARGUS_STRATEGY_FUNC` | `generate_intent` | Function name |
+| Variable        | Default   | Description                    |
+|-----------------|-----------|--------------------------------|
+| `PRIME_DRY_RUN` | `0`       | Set to `1` for paper trading   |
+| `ARGUS_DRY_RUN` | `0`       | Alternate dry-run flag         |
+| `ARGUS_MODE`    | `legacy`  | Set to `prime` for Prime engine |
+
+### Product & Paths
+
+| Variable           | Default   | Description                          |
+|--------------------|-----------|--------------------------------------|
+| `ARGUS_PRODUCT_ID` | `BTC-USD` | Product and file namespacing         |
+
+### External Strategy (Single-Asset)
+
+| Variable               | Example                                  | Description   |
+|------------------------|------------------------------------------|---------------|
+| `ARGUS_STRATEGY_MODULE`| `research.strategies.sg_core_exposure_v1` | Module path   |
+| `ARGUS_STRATEGY_FUNC`  | `generate_intent`                        | Function name |
+
+### Prime Governors
+
+| Variable                  | Default | Description                          |
+|---------------------------|---------|--------------------------------------|
+| `PRIME_CONF_MIN`          | `0.64`  | Min confidence to act                |
+| `PRIME_HORIZON`            | `48`    | Default horizon hours                |
+| `PRIME_MAX_EXPOSURE`       | `0.25`  | Max exposure fraction                |
+| `PRIME_EXIT_MIN_HOLD_H`    | `0`     | Min hours before non-panic exit      |
+| `PRIME_REENTRY_COOLDOWN_H` | `0`     | Hours before re-entry after exit     |
+| `PRIME_MIN_NOTIONAL_USD`   | `5`     | Min notional per trade               |
+| Drawdown bands            | —       | `PRIME_DD_SOFT`, `PRIME_DD_HARD`, `PRIME_DD_KILL`, `PRIME_DD_SOFT_MULT` |
 
 ### Regime Engine
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REGIME_EMA_FAST` | `20` | Fast EMA period |
-| `REGIME_EMA_SLOW` | `50` | Slow EMA period |
-| `REGIME_ATR_LEN` | `14` | ATR period |
-| `REGIME_TREND_THRESH` | `0.25` | Trend strength threshold |
-| `REGIME_VOL_LO` | `0.003` | Vol compression threshold |
-| `REGIME_VOL_HI` | `0.025` | Vol expansion threshold |
-| `REGIME_PANIC_HI` | `0.040` | Panic threshold |
 
-### Strategy-Specific
+| Variable             | Default | Description                |
+|----------------------|---------|----------------------------|
+| `REGIME_EMA_FAST`    | `20`    | Fast EMA period            |
+| `REGIME_EMA_SLOW`    | `50`    | Slow EMA period            |
+| `REGIME_ATR_LEN`     | `14`    | ATR period                 |
+| `REGIME_TREND_THRESH`| `0.25`  | Trend strength threshold   |
+| `REGIME_VOL_LO`      | `0.003` | Vol compression threshold |
+| `REGIME_VOL_HI`      | `0.025` | Vol expansion threshold    |
+| `REGIME_PANIC_HI`    | `0.040` | Panic threshold           |
 
-See individual strategy docstrings for full environment variable documentation.
+### Portfolio Mode
+
+| Variable                      | Default | Description              |
+|------------------------------|---------|--------------------------|
+| `ARGUS_PORTFOLIO_PRODUCTS`    | —       | Required, e.g. `BTC-USD,ETH-USD` |
+| `PORTFOLIO_MAX_GROSS_EXPOSURE`| `1.0`   | Max gross exposure       |
+| `PORTFOLIO_MAX_WEIGHT_PER_ASSET` | `0.85` | Max weight per asset |
+| `PORTFOLIO_MIN_WEIGHT_PER_ASSET` | `0.0`  | Min weight per asset |
+| `PORTFOLIO_ALLOW_CASH`       | `True`  | Allow cash in allocation |
+
+### Exit Watcher (5‑min)
+
+| Variable                     | Default | Description                |
+|-----------------------------|---------|----------------------------|
+| `ARGUS_EARLY_EXIT_ENABLED`  | `1`     | Enable early-exit checks   |
+| `ARGUS_EARLY_EXIT_MIN_HOURS`| `0.5`   | Min hold before early exit |
+| `ARGUS_EARLY_EXIT_PROFIT_PCT` | `0.01` | Profit % hurdle for early exit |
+
+Strategy-specific variables are documented in each strategy’s docstring and in **research/configs/** (e.g. `core_v2`).
 
 ---
 
 ## cortex.json Output
 
-The signal generator writes decision state to `cortex.json`:
+The signal generator writes decision state to `cortex.json` (or `cortex_<slug>.json`):
 
 ```json
 {
@@ -366,50 +474,58 @@ The signal generator writes decision state to `cortex.json`:
 
 ### Adding New Strategies
 
-1. Create strategy in `runtime/argus/research/strategies/sg_your_strategy.py`
-2. Implement `generate_intent(df, ctx, *, closed_only=True) -> dict`
-3. Call Layer 1: `from research.regime import classify_regime`
-4. Return the standard intent dict (action, confidence, desired_exposure_frac, horizon_hours, reason, meta)
-5. Test with smoke tests before live use
+1. Create a module under `runtime/argus/research/strategies/` (e.g. `sg_my_strategy_v1.py`).
+2. Implement `generate_intent(df, ctx, *, closed_only=True) -> dict` with keys: `action`, `confidence`, `desired_exposure_frac`, `horizon_hours`, `reason`, `meta`.
+3. Call Layer 1: `from research.regime import classify_regime` (with `sys.path` including `runtime/argus`).
+4. Run regime and strategy smoke tests before live use.
 
 ### Running Tests
 
 ```powershell
-# Regime Engine test
+# From repo root, with runtime/argus on path
 python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.regime_smoke import main; main()"
-
-# Strategy test
 python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.harness.strategy_smoke import main; main()"
 
-# Verify strategy import
-python -c "import sys; sys.path.insert(0, r'./runtime/argus'); from research.strategies.sg_core_exposure_v1 import generate_intent; print('OK')"
+# Multi-product path/config check (no broker)
+cd runtime/argus && python sweep_multi_product.py
+
+# Full execution test (needs API keys)
+cd runtime/argus && python test_execution.py
 ```
+
+### Strategy Configs
+
+Use **research/configs/** (e.g. **core_v2/btc_core_v2_tuned_*.env**) to hold strategy and regime env vars for backtests and live; source or copy into `.env` as needed.
 
 ---
 
 ## Key Features
 
 ### Signal Generation
-- **Regime Detection**: Volatility + trend-based market state classification (Layer 1)
-- **Pluggable Strategies**: Hot-swappable via environment variables (Layer 2)
-- **ML Ensemble**: Optional p_long confirmation from Random Forest model
+
+- **Regime detection**: Volatility + trend-based market state (Layer 1).
+- **Pluggable strategies**: Hot-swap via `ARGUS_STRATEGY_MODULE` / `ARGUS_STRATEGY_FUNC` (Layer 2).
+- **ML ensemble**: Optional `p_long` from Random Forest in Prime mode.
 
 ### Risk Management
-- **Drawdown Governors**: Soft/Hard/Kill bands based on peak equity
-- **Execution Gates**: Wallet verification, min notional, cooldown periods
-- **Timeline Safety**: Closed-candle-only decisions prevent lookahead
-- **Panic Exit**: Automatic exit on PANIC regime
 
-### Research Tools
-- **Smoke Tests**: Validate strategy logic without broker connection
-- **Deterministic Execution**: Same input → same output for reproducibility
-- **Backtest Integration**: Strategies work in both live and backtest contexts
+- **Drawdown governors**: Soft/Hard/Kill bands and optional soft mult.
+- **Execution gates**: Wallet verification, min notional, reentry cooldown, min-hold before exit.
+- **Timeline safety**: Closed-candle-only decisions.
+- **Panic exit**: Automatic exit on PANIC regime; early-exit via exit watcher when enabled.
+
+### Research & Ops
+
+- **Smoke tests**: Regime and strategy validation without broker.
+- **Backtest runner**: Same strategy interface for backtests (see `research/harness/backtest_runner.py`).
+- **Multi-product**: BTC/ETH (or other products) via `ARGUS_PRODUCT_ID` and namespaced files.
+- **Portfolio mode**: Multi-asset allocation via `run_portfolio_live.py` and research portfolio allocator.
 
 ---
 
 ## License
 
-MIT License - See `LICENSE` for details.
+MIT License — see `LICENSE` for details.
 
 > **Disclaimer**: This software is for educational and research purposes only. Trading involves substantial risk of loss. Past performance does not guarantee future results.
 
@@ -417,4 +533,4 @@ MIT License - See `LICENSE` for details.
 
 ## Acknowledgments
 
-Built with Python, pandas, scikit-learn, and Streamlit.
+Built with Python, pandas, pandas-ta, scikit-learn, Streamlit, and Coinbase Advanced Trade (`coinbase-advanced-py`).
