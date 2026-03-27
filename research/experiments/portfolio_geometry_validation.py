@@ -59,6 +59,11 @@ from cost_regimes import (
     COST_REGIME_RETAIL_LAUNCH,
     resolve_cost_params,
 )
+from moonwire_loader import (
+    config_from_env as moonwire_config_from_env,
+    get_series_for_timeline as moonwire_get_series_for_timeline,
+    load_feed as moonwire_load_feed,
+)
 
 # ---------------------------------------------------------------------
 # Canonical windows (MUST match existing Itera reports)
@@ -78,6 +83,7 @@ WINDOWS = [
 # ---------------------------------------------------------------------
 SCENARIOS = [
     "BTC_CORE_ONLY",
+    "BTC_MOONWIRE_ONLY",
     "ETH_CORE_ONLY",
     "STATIC_80_20",
     "STATIC_70_30",
@@ -115,7 +121,6 @@ CORE_MODULE = CORE_MODULE_CANDIDATES = [
 ]
 CORE_FUNC = "generate_intent"
 
-
 @dataclass(frozen=True)
 class RunConfig:
     mode: str  # "net" or "gross"
@@ -128,6 +133,9 @@ class RunConfig:
     btc_data_file: Path
     eth_data_file: Path
     debug_trace_max_bars: Optional[int] = None  # limit timeline for fast trace (e.g. 2000)
+    max_bars: Optional[int] = None  # fast run: truncate to first N closed bars BEFORE core computation
+    start_date: Optional[str] = None  # optional YYYY-MM-DD: slice merged timeline to ts >= start (before core)
+    end_date: Optional[str] = None  # optional YYYY-MM-DD: slice merged timeline to ts <= end (before core)
     initial_equity: float = 10000.0  # USD; geometry uses equity_index (1.0) internally, equity_usd = index * this
     output_suffix: Optional[str] = None  # e.g. "retail_launch" for batch; used in manifest + trace paths
 
@@ -219,6 +227,31 @@ def _merge_prices(df_btc: pd.DataFrame, df_eth: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
+def _slice_df_to_timeline_window(
+    asset_df: pd.DataFrame,
+    timeline: pd.DataFrame,
+    lookback: int,
+) -> pd.DataFrame:
+    """
+    Slice asset_df to the minimal window needed for core/sim: lookback bars before
+    the first timeline timestamp, then all bars through the last timeline timestamp.
+    Ensures compute_core_series receives only the rows required for the chosen timeline.
+    """
+    if timeline.empty or len(asset_df) < lookback + 1:
+        return asset_df
+    first_ts = pd.to_datetime(timeline["Timestamp"].iloc[0], utc=True)
+    last_ts = pd.to_datetime(timeline["Timestamp"].iloc[-1], utc=True)
+    ts = pd.to_datetime(asset_df["Timestamp"], utc=True)
+    # Integer positions: start = first row >= first_ts; end = one past last row <= last_ts
+    pos0 = ts.searchsorted(first_ts, side="left")
+    pos_end = ts.searchsorted(last_ts, side="right")
+    start = max(0, pos0 - lookback)
+    end = pos_end
+    if end <= start:
+        return asset_df
+    return asset_df.iloc[start:end].reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------
 # Existing Core implementation adapter (no logic changes)
 # ---------------------------------------------------------------------
@@ -268,6 +301,23 @@ def _extract_macro_bull(out: Dict) -> Optional[bool]:
     if mb is None:
         return None
     return bool(mb)
+
+
+def _log_run_df_bars(
+    product_id: str,
+    run_df_bars: int,
+    sliced: bool,
+    merged_bars: int,
+) -> None:
+    """Guard log before core compute: RUN DF BARS and optional assert when slice is active."""
+    print(f"  RUN DF BARS: {product_id} df={run_df_bars} (sliced={sliced}) merged_timeline={merged_bars}", flush=True)
+    if sliced and merged_bars > 0:
+        # Core output bars = run_df_bars - CORE_MIN_BARS; should align to merged_timeline
+        expected_core_bars = run_df_bars - CORE_MIN_BARS
+        assert expected_core_bars <= merged_bars + 2, (
+            f"Run sliced: {product_id} core would produce {expected_core_bars} bars but merged has {merged_bars}; "
+            "run df must match slice."
+        )
 
 
 def _compute_core_series(
@@ -349,6 +399,25 @@ def _compute_core_series(
     return df.reset_index(drop=True)
 
 
+def _compute_moonwire_series_for_timeline(
+    timeline: pd.DataFrame,
+    signal_path: Path,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute MoonWire w_btc and prob_used for the merged timeline (Experiment 1).
+    Uses moonwire_loader: reads JSONL feed, applies weight rule, STRICT_TS_MATCH for missing bars.
+    Returns (w_btc, prob_used) arrays of length len(timeline). Weights at bar t apply to return t->t+1.
+    """
+    feed = moonwire_load_feed(signal_path)
+    config = moonwire_config_from_env()
+    ts_utc = pd.to_datetime(timeline["Timestamp"], utc=True)
+    bar_timestamps_unix = np.array([int(t.timestamp()) for t in ts_utc], dtype=float)
+    print("  BTC (MoonWire): computing series (%d bars) ..." % len(timeline), flush=True)
+    w_btc, prob_used = moonwire_get_series_for_timeline(bar_timestamps_unix, feed, config)
+    print("  BTC (MoonWire): done.", flush=True)
+    return w_btc, prob_used
+
+
 def _align_series_to_timeline(timeline: pd.DataFrame, series: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """
     Align to merged timeline using strict intersection (no forward fill).
@@ -379,10 +448,12 @@ def _build_weights(
     x_btc: np.ndarray,
     x_eth: np.ndarray,
     btc_macro_is_bear: Optional[np.ndarray],
+    x_btc_moonwire: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns (w_btc, w_eth, w_cash) arrays, where weights are computed at time t.
     Static splits apply on top of Core exposure (no forced exposure).
+    For BTC_MOONWIRE_ONLY, x_btc_moonwire must be provided (MoonWire feed-driven exposure).
     """
     if scenario not in SCENARIOS:
         raise ValueError(f"Unknown scenario: {scenario}")
@@ -390,6 +461,14 @@ def _build_weights(
     if scenario == "BTC_CORE_ONLY":
         w_btc = 1.0 * x_btc
         w_eth = 0.0 * x_eth
+    elif scenario == "BTC_MOONWIRE_ONLY":
+        if x_btc_moonwire is None:
+            raise RuntimeError("BTC_MOONWIRE_ONLY requires x_btc_moonwire; ensure MOONWIRE_SIGNAL_FILE is set.")
+        w_btc = 1.0 * x_btc_moonwire
+        w_eth = np.zeros_like(w_btc)
+        gross = w_btc + w_eth
+        w_cash = 1.0 - np.abs(w_btc)  # no leverage
+        return w_btc, w_eth, w_cash
     elif scenario == "ETH_CORE_ONLY":
         w_btc = 0.0 * x_btc
         w_eth = 1.0 * x_eth
@@ -594,15 +673,23 @@ def _compute_metrics(sim: pd.DataFrame, start: str, end: str) -> Dict[str, float
             "TimeToRecoveryBars": float("nan"),
             "AvgGrossExposure": float("nan"),
             "Turnover": float("nan"),
+            "period_days": float("nan"),
+            "total_return_pct": float("nan"),
         }
 
     # Metrics use equity_index (scale-invariant); no absolute-dollar metrics here
     eq = w["equity_index"].to_numpy(dtype=float)
     rets = w["port_ret_net_next"].to_numpy(dtype=float)
 
-    # Hourly bars: approximate periods/year = 365.25*24
-    periods_per_year = 365.25 * 24.0
-    years = (len(w) / periods_per_year)
+    # Period from actual timestamps (so annualized metrics use slice/window duration, not full-dataset years)
+    t_min = pd.to_datetime(w["Timestamp"].min(), utc=True)
+    t_max = pd.to_datetime(w["Timestamp"].max(), utc=True)
+    period_seconds = (t_max - t_min).total_seconds()
+    period_days = period_seconds / 86400.0
+    years = period_days / 365.25 if period_days > 0 else float("nan")
+    # Periods per year for Sortino: from bar count and period length (hourly => 365.25*24)
+    n_bars = len(w) - 1  # number of complete return periods
+    periods_per_year = (n_bars / years) if years and years > 0 else (365.25 * 24.0)
 
     cagr_v = _cagr(eq, years=years)
     maxdd_v = _max_drawdown(eq)
@@ -614,6 +701,10 @@ def _compute_metrics(sim: pd.DataFrame, start: str, end: str) -> Dict[str, float
     avg_gross = float(np.nanmean(w["gross_exposure"].to_numpy(dtype=float)))
     turnover_mean = float(np.nanmean(w["turnover"].to_numpy(dtype=float)))
 
+    start_eq = eq[0]
+    end_eq = eq[-1]
+    total_return_pct = float((end_eq / start_eq - 1.0) * 100.0) if start_eq and start_eq > 0 else float("nan")
+
     return {
         "CAGR": cagr_v,
         "MaxDD": maxdd_v,
@@ -623,12 +714,26 @@ def _compute_metrics(sim: pd.DataFrame, start: str, end: str) -> Dict[str, float
         "TimeToRecoveryBars": float(ttr_bars),
         "AvgGrossExposure": avg_gross,
         "Turnover": turnover_mean,
+        "period_days": float(period_days),
+        "total_return_pct": total_return_pct,
     }
 
 
 # ---------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------
+def _window_overlaps_run(
+    window_start: str,
+    window_end: str,
+    run_start_utc: pd.Timestamp,
+    run_end_utc: pd.Timestamp,
+) -> bool:
+    """True if the run's date range [run_start_utc, run_end_utc] overlaps the window [window_start, window_end]."""
+    w_start = pd.Timestamp(window_start, tz="UTC")
+    w_end = pd.Timestamp(window_end, tz="UTC")
+    return run_start_utc <= w_end and run_end_utc >= w_start
+
+
 def _ensure_out_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -640,16 +745,42 @@ def run(cfg: RunConfig) -> pd.DataFrame:
     btc = _prep_closed_bars(btc_raw)
     eth = _prep_closed_bars(eth_raw)
 
-    # 2) Resolve and print Core params (audit / reproducibility)
-    resolved_params = _resolve_core_params_btc(btc)
-    print("Resolved Core params:")
-    print(json.dumps(resolved_params, indent=2))
-
-    # 3) Merge timeline (intersection only)
+    # 2) Merge timeline (intersection only)
     timeline = _merge_prices(btc, eth)
 
-    # Optional: limit bars early so core + sim run on subset only (debug trace)
-    if getattr(cfg, "debug_trace_max_bars", None) and cfg.debug_trace_max_bars > 0:
+    # Time window: slice to [start, end] AFTER merge, BEFORE core (targeted date ranges e.g. Dec 2025)
+    start_date = getattr(cfg, "start_date", None)
+    end_date = getattr(cfg, "end_date", None)
+    if start_date is not None or end_date is not None:
+        ts = pd.to_datetime(timeline["Timestamp"], utc=True)
+        if start_date is not None:
+            start_ts = pd.Timestamp(start_date, tz="UTC")
+            timeline = timeline.loc[ts >= start_ts].reset_index(drop=True)
+            ts = pd.to_datetime(timeline["Timestamp"], utc=True)
+        if end_date is not None:
+            end_ts = pd.Timestamp(end_date, tz="UTC")
+            timeline = timeline.loc[ts <= end_ts].reset_index(drop=True)
+        min_bars = CORE_MIN_BARS + 2
+        if len(timeline) < min_bars:
+            raise ValueError(
+                f"WINDOW SLICE: after start={start_date!r} end={end_date!r} the timeline has {len(timeline)} bars; "
+                f"need at least {min_bars} (lookback {CORE_MIN_BARS} + 2). Reduce the window or use full data."
+            )
+        btc = _slice_df_to_timeline_window(btc, timeline, CORE_MIN_BARS)
+        eth = _slice_df_to_timeline_window(eth, timeline, CORE_MIN_BARS)
+        print(f"WINDOW SLICE: start={start_date!r}, end={end_date!r}, bars={len(timeline)}")
+
+    # Fast run: truncate to first N closed bars BEFORE any core computation (saves 45–60 min)
+    max_bars = getattr(cfg, "max_bars", None)
+    if max_bars is not None and max_bars > 0:
+        n = min(len(timeline), max_bars)
+        timeline = timeline.iloc[:n].reset_index(drop=True)
+        btc = _slice_df_to_timeline_window(btc, timeline, CORE_MIN_BARS)
+        eth = _slice_df_to_timeline_window(eth, timeline, CORE_MIN_BARS)
+        print(f"FAST MODE: max_bars={n} (processing first {n} closed bars after intersection)")
+
+    # Optional: limit bars for debug trace only (when --max_bars not set); does not slice asset dfs by count
+    elif getattr(cfg, "debug_trace_max_bars", None) and cfg.debug_trace_max_bars > 0:
         n = min(len(timeline), cfg.debug_trace_max_bars)
         timeline = timeline.iloc[:n].reset_index(drop=True)
         last_ts = timeline["Timestamp"].iloc[-1]
@@ -657,17 +788,53 @@ def run(cfg: RunConfig) -> pd.DataFrame:
         eth = eth[eth["Timestamp"] <= last_ts].reset_index(drop=True)
         print(f"  Limited to first {n} bars (--debug_trace_max_bars); core/sim on subset only")
 
-    # 4) Compute Core series via existing implementation (no changes)
-    btc_core = _compute_core_series("BTC-USD", btc)
-    eth_core = _compute_core_series("ETH-USD", eth)
+    # Canonical run dataframes: ALL downstream uses this slice only (no raw unsliced df references).
+    run_sliced = (
+        start_date is not None
+        or end_date is not None
+        or (max_bars is not None and max_bars > 0)
+    )
+    merged_df_run = timeline.copy()
+    btc_df_run = btc.copy()
+    eth_df_run = eth.copy()
+    if run_sliced:
+        print(f"RUN DF: merged={len(merged_df_run)} bars, btc={len(btc_df_run)} bars, eth={len(eth_df_run)} bars (sliced=True)")
+
+    # Run date boundaries (for reporting and window overlap); use actual timestamps from merged run
+    run_start_ts = pd.to_datetime(merged_df_run["Timestamp"].iloc[0], utc=True)
+    run_end_ts = pd.to_datetime(merged_df_run["Timestamp"].iloc[-1], utc=True)
+    run_start_date = run_start_ts.strftime("%Y-%m-%d")
+    run_end_date = run_end_ts.strftime("%Y-%m-%d")
+    run_bars = len(merged_df_run)
+
+    # Resolve and print Core params from run dataframe (audit / reproducibility)
+    resolved_params = _resolve_core_params_btc(btc_df_run)
+    print("Resolved Core params:")
+    print(json.dumps(resolved_params, indent=2))
+
+    # 4) Compute Core series via existing implementation (no changes) — always on run dataframes only.
+    _log_run_df_bars("BTC-USD", len(btc_df_run), run_sliced, len(merged_df_run))
+    if run_sliced:
+        assert len(btc_df_run) < 20000, (
+            f"Run is sliced but btc_df_run has {len(btc_df_run)} bars; expected < 20k. "
+            "Core must run on sliced window only."
+        )
+    btc_core = _compute_core_series("BTC-USD", btc_df_run)
+    _log_run_df_bars("ETH-USD", len(eth_df_run), run_sliced, len(merged_df_run))
+    if run_sliced:
+        assert len(eth_df_run) < 20000, (
+            f"Run is sliced but eth_df_run has {len(eth_df_run)} bars; expected < 20k. "
+            "Core must run on sliced window only."
+        )
+    eth_core = _compute_core_series("ETH-USD", eth_df_run)
 
     # 5) Align core series to unified timeline (intersection only, no fill)
-    timeline, btc_aligned = _align_series_to_timeline(
-        timeline,
+    merged_df_run, btc_aligned = _align_series_to_timeline(
+        merged_df_run,
         btc_core,
         cols=["x_core"] + (["btc_macro_is_bear"] if "btc_macro_is_bear" in btc_core.columns else []),
     )
-    timeline, eth_aligned = _align_series_to_timeline(timeline, eth_core, cols=["x_core"])
+    merged_df_run, eth_aligned = _align_series_to_timeline(merged_df_run, eth_core, cols=["x_core"])
 
     # BTC macro bear flag (required for regime-conditioned scenario)
     btc_macro = None
@@ -681,14 +848,49 @@ def run(cfg: RunConfig) -> pd.DataFrame:
     x_btc = btc_aligned["x_core"].to_numpy(dtype=float)
     x_eth = eth_aligned["x_core"].to_numpy(dtype=float)
 
+    # Scenarios to run: skip BTC_MOONWIRE_ONLY unless MOONWIRE_SIGNAL_FILE is set and file exists
+    scenarios_to_run = [
+        s for s in SCENARIOS
+        if s != "BTC_MOONWIRE_ONLY" or os.environ.get("MOONWIRE_SIGNAL_FILE")
+    ]
+    if "BTC_MOONWIRE_ONLY" in SCENARIOS and "BTC_MOONWIRE_ONLY" not in scenarios_to_run:
+        print("Skipping BTC_MOONWIRE_ONLY (MOONWIRE_SIGNAL_FILE not set)")
+
+    # If MoonWire scenario is requested, ensure the signal file exists; otherwise skip with warning
+    if "BTC_MOONWIRE_ONLY" in scenarios_to_run:
+        signal_path = Path(os.environ["MOONWIRE_SIGNAL_FILE"])
+        if not signal_path.is_absolute():
+            signal_path = (REPO_ROOT / signal_path).resolve()
+        if not signal_path.exists():
+            scenarios_to_run = [s for s in scenarios_to_run if s != "BTC_MOONWIRE_ONLY"]
+            print(
+                "Skipping BTC_MOONWIRE_ONLY: signal file not found: %s\n"
+                "  Ensure feed: python scripts/ensure_moonwire_signal_feed.py (or set MOONWIRE_SIGNAL_FILE to an existing path)."
+                % signal_path
+            )
+
+    # MoonWire-only series (Experiment 1): loader reads JSONL, aligns to timeline, applies weight rule
+    x_btc_moonwire: Optional[np.ndarray] = None
+    prob_used_moonwire: Optional[np.ndarray] = None
+    if "BTC_MOONWIRE_ONLY" in scenarios_to_run:
+        x_btc_moonwire, prob_used_moonwire = _compute_moonwire_series_for_timeline(
+            merged_df_run, signal_path
+        )
+
     rows = []
 
     # 6) Scenario loop: build weights -> simulate -> window metrics
-    for scenario in SCENARIOS:
-        w_btc, w_eth, w_cash = _build_weights(scenario, x_btc=x_btc, x_eth=x_eth, btc_macro_is_bear=btc_macro)
+    for scenario in scenarios_to_run:
+        w_btc, w_eth, w_cash = _build_weights(
+            scenario,
+            x_btc=x_btc,
+            x_eth=x_eth,
+            btc_macro_is_bear=btc_macro,
+            x_btc_moonwire=x_btc_moonwire,
+        )
 
         sim = _simulate(
-            timeline_prices=timeline,
+            timeline_prices=merged_df_run,
             w_btc_t=w_btc,
             w_eth_t=w_eth,
             w_cash_t=w_cash,
@@ -699,71 +901,128 @@ def run(cfg: RunConfig) -> pd.DataFrame:
         )
 
         # Per-bar trace export for BTC_CORE_ONLY (behavioral diff)
-        # ROOT CAUSE FIX: Harness does NOT drop the last bar and caps at lookback+DEBUG_TRACE_MAX_BARS.
-        # Geometry was using prepped btc (last bar dropped) and trim by merge last_ts, so bar set and
-        # row count differed. We now load BTC for the trace exactly like the harness (no drop last,
-        # cap at lookback+debug_trace_max_bars), compute core from that, then slice so first row = bar 200.
+        # When run_sliced (--start/--end or --max_bars): use same run data only — export from sim (no second load/core).
+        # When not sliced: match harness bar set (load BTC, compute core, cap at lookback+N).
         if scenario == "BTC_CORE_ONLY":
             debug_dir = REPO_ROOT / "debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
             _trace_suffix = f"__{cfg.output_suffix}" if cfg.output_suffix else ""
             trace_path = debug_dir / f"geometry_btc_trace{_trace_suffix}.csv"
-            btc_trace = _load_btc_for_harness_trace(
-                cfg.btc_data_file,
-                lookback=HARNESS_LOOKBACK,
-                max_trading_bars=cfg.debug_trace_max_bars,
-            )
-            btc_core_trace = _compute_core_series(
-                "BTC-USD", btc_trace, match_harness_bar_set=True
-            )
-            timeline_btc_only = btc_trace[["Timestamp", "Close"]].copy()
-            timeline_btc_only["btc_close"] = timeline_btc_only["Close"].astype(float)
-            timeline_btc_only["eth_close"] = timeline_btc_only["Close"].astype(float)
-            btc_core_cols = ["x_core"] + (["btc_macro_is_bear"] if "btc_macro_is_bear" in btc_core_trace.columns else [])
-            timeline_btc_aligned, btc_core_btc_aligned = _align_series_to_timeline(
-                timeline_btc_only, btc_core_trace, cols=btc_core_cols
-            )
-            x_btc_trace = btc_core_btc_aligned["x_core"].to_numpy(dtype=float)
-            w_eth_trace = np.zeros(len(x_btc_trace), dtype=float)
-            w_cash_trace = 1.0 - x_btc_trace
-            sim_trace = _simulate(
-                timeline_prices=timeline_btc_aligned,
-                w_btc_t=x_btc_trace,
-                w_eth_t=w_eth_trace,
-                w_cash_t=w_cash_trace,
-                mode=cfg.mode,
-                fee_bps=cfg.fee_bps,
-                slippage_bps=cfg.slippage_bps,
-                initial_equity=cfg.initial_equity,
-            )
-            trace_skip = HARNESS_LOOKBACK - CORE_MIN_BARS
-            sim_trace = sim_trace.iloc[trace_skip:].reset_index(drop=True)
-            # desired_exposure_frac: from strategy (for BTC_CORE_ONLY = w_btc = gross_exposure)
-            trace_df = pd.DataFrame({
-                "timestamp": sim_trace["Timestamp"],
-                "close_price": sim_trace["btc_close"],
-                "exposure": sim_trace["gross_exposure"],
-                "next_bar_return": sim_trace["r_btc_next"],
-                "portfolio_return": sim_trace["port_ret_net_next"],
-                "equity_index": sim_trace["equity_index"],
-                "equity_usd": sim_trace["equity_usd"],
-                "desired_exposure_frac": sim_trace["w_btc"],
-                "applied_exposure": sim_trace["gross_exposure"],
-                "bar_return_px": sim_trace["r_btc_next"],
-                "bar_return_applied": sim_trace["port_ret_net_next"],
-                "fee_slippage_this_bar": sim_trace["cost_next"],
-                "rebalanced": (sim_trace["turnover"].to_numpy(dtype=float) > 1e-9),
-            })
-            trace_df["cost_regime"] = cfg.cost_regime
-            trace_df.to_csv(trace_path, index=False)
-            print(f"Trace written: {trace_path} ({len(trace_df)} rows, BTC loaded like harness: no drop-last, cap lookback+N)")
+            if run_sliced:
+                # Sliced run: sim is already on merged_df_run; export only the run window (no full-dataset compute).
+                trace_df = pd.DataFrame({
+                    "timestamp": sim["Timestamp"],
+                    "close_price": sim["btc_close"],
+                    "exposure": sim["gross_exposure"],
+                    "next_bar_return": sim["r_btc_next"],
+                    "portfolio_return": sim["port_ret_net_next"],
+                    "equity_index": sim["equity_index"],
+                    "equity_usd": sim["equity_usd"],
+                    "desired_exposure_frac": sim["w_btc"],
+                    "applied_exposure": sim["gross_exposure"],
+                    "bar_return_px": sim["r_btc_next"],
+                    "bar_return_applied": sim["port_ret_net_next"],
+                    "fee_slippage_this_bar": sim["cost_next"],
+                    "rebalanced": (sim["turnover"].to_numpy(dtype=float) > 1e-9),
+                })
+                trace_df["cost_regime"] = cfg.cost_regime
+                trace_df.to_csv(trace_path, index=False)
+                print(f"Trace written: {trace_path} ({len(trace_df)} rows, sliced run)")
+            else:
+                _trace_max_bars = cfg.max_bars if (getattr(cfg, "max_bars", None) is not None) else cfg.debug_trace_max_bars
+                btc_trace = _load_btc_for_harness_trace(
+                    cfg.btc_data_file,
+                    lookback=HARNESS_LOOKBACK,
+                    max_trading_bars=_trace_max_bars,
+                )
+                btc_core_trace = _compute_core_series(
+                    "BTC-USD", btc_trace, match_harness_bar_set=True
+                )
+                timeline_btc_only = btc_trace[["Timestamp", "Close"]].copy()
+                timeline_btc_only["btc_close"] = timeline_btc_only["Close"].astype(float)
+                timeline_btc_only["eth_close"] = timeline_btc_only["Close"].astype(float)
+                btc_core_cols = ["x_core"] + (["btc_macro_is_bear"] if "btc_macro_is_bear" in btc_core_trace.columns else [])
+                timeline_btc_aligned, btc_core_btc_aligned = _align_series_to_timeline(
+                    timeline_btc_only, btc_core_trace, cols=btc_core_cols
+                )
+                x_btc_trace = btc_core_btc_aligned["x_core"].to_numpy(dtype=float)
+                w_eth_trace = np.zeros(len(x_btc_trace), dtype=float)
+                w_cash_trace = 1.0 - x_btc_trace
+                sim_trace = _simulate(
+                    timeline_prices=timeline_btc_aligned,
+                    w_btc_t=x_btc_trace,
+                    w_eth_t=w_eth_trace,
+                    w_cash_t=w_cash_trace,
+                    mode=cfg.mode,
+                    fee_bps=cfg.fee_bps,
+                    slippage_bps=cfg.slippage_bps,
+                    initial_equity=cfg.initial_equity,
+                )
+                trace_skip = HARNESS_LOOKBACK - CORE_MIN_BARS
+                sim_trace = sim_trace.iloc[trace_skip:].reset_index(drop=True)
+                trace_df = pd.DataFrame({
+                    "timestamp": sim_trace["Timestamp"],
+                    "close_price": sim_trace["btc_close"],
+                    "exposure": sim_trace["gross_exposure"],
+                    "next_bar_return": sim_trace["r_btc_next"],
+                    "portfolio_return": sim_trace["port_ret_net_next"],
+                    "equity_index": sim_trace["equity_index"],
+                    "equity_usd": sim_trace["equity_usd"],
+                    "desired_exposure_frac": sim_trace["w_btc"],
+                    "applied_exposure": sim_trace["gross_exposure"],
+                    "bar_return_px": sim_trace["r_btc_next"],
+                    "bar_return_applied": sim_trace["port_ret_net_next"],
+                    "fee_slippage_this_bar": sim_trace["cost_next"],
+                    "rebalanced": (sim_trace["turnover"].to_numpy(dtype=float) > 1e-9),
+                })
+                trace_df["cost_regime"] = cfg.cost_regime
+                trace_df.to_csv(trace_path, index=False)
+                print(f"Trace written: {trace_path} ({len(trace_df)} rows, BTC loaded like harness: no drop-last, cap lookback+N)")
 
-        for window_name, start, end in WINDOWS:
+        # Per-bar trace for BTC_MOONWIRE_ONLY (Experiment 1): w_btc, w_cash, prob_used (or NaN when HOLD)
+        if scenario == "BTC_MOONWIRE_ONLY":
+            debug_dir = REPO_ROOT / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            _trace_suffix = f"__{cfg.output_suffix}" if cfg.output_suffix else ""
+            trace_path_mw = debug_dir / f"geometry_btc_moonwire_trace{_trace_suffix}.csv"
+            trace_df_mw = pd.DataFrame({
+                "timestamp": sim["Timestamp"],
+                "close": sim["btc_close"],
+                "w_btc": sim["w_btc"],
+                "w_cash": sim["w_cash"],
+                "prob_used": prob_used_moonwire if prob_used_moonwire is not None else np.nan,
+                "desired_exposure_frac": sim["w_btc"],
+                "applied_exposure": sim["gross_exposure"],
+                "bar_return_px": sim["r_btc_next"],
+                "bar_return_applied": sim["port_ret_net_next"],
+                "fee_slippage_this_bar": sim["cost_next"],
+                "equity_index": sim["equity_index"],
+                "equity_usd": sim["equity_usd"],
+                "rebalanced": (sim["turnover"].to_numpy(dtype=float) > 1e-9),
+            })
+            trace_df_mw["cost_regime"] = cfg.cost_regime
+            trace_df_mw.to_csv(trace_path_mw, index=False)
+            print(f"Trace written: {trace_path_mw} ({len(trace_df_mw)} rows, BTC_MOONWIRE_ONLY)")
+
+        # When sliced, only emit windows that overlap the run's date range; otherwise emit all windows
+        windows_to_emit = WINDOWS
+        if run_sliced:
+            windows_to_emit = [
+                (wn, ws, we)
+                for wn, ws, we in WINDOWS
+                if _window_overlaps_run(ws, we, run_start_ts, run_end_ts)
+            ]
+
+        for window_name, start, end in windows_to_emit:
             m = _compute_metrics(sim, start=start, end=end)
             # Final equity (USD) at end of window for cross-check with harness
             ts = pd.to_datetime(sim["Timestamp"], utc=True)
             w = sim[(ts >= pd.Timestamp(start, tz="UTC")) & (ts <= pd.Timestamp(end, tz="UTC"))]
             final_equity_usd = float(w["equity_usd"].iloc[-1]) if len(w) > 0 else float("nan")
+
+            # Output start/end: slice boundaries when run is sliced, else window boundaries
+            out_start = run_start_date if run_sliced else start
+            out_end = run_end_date if run_sliced else end
 
             # Include crash-window DD and post-crash CAGR in appropriate window rows
             crash_window_dd = m["MaxDD"] if window_name == "crash_window" else float("nan")
@@ -774,8 +1033,8 @@ def run(cfg: RunConfig) -> pd.DataFrame:
                     "scenario": scenario,
                     "window": window_name,
                     "cost_regime": cfg.cost_regime,
-                    "start": start,
-                    "end": end,
+                    "start": out_start,
+                    "end": out_end,
                     "mode": cfg.mode,
                     "fee_bps": cfg.fee_bps,
                     "slippage_bps": cfg.slippage_bps,
@@ -787,6 +1046,8 @@ def run(cfg: RunConfig) -> pd.DataFrame:
                     "TimeToRecoveryBars": m["TimeToRecoveryBars"],
                     "AvgGrossExposure": m["AvgGrossExposure"],
                     "Turnover": m["Turnover"],
+                    "period_days": m["period_days"],
+                    "total_return_pct": m["total_return_pct"],
                     "CrashWindowDD": crash_window_dd,
                     "PostCrashCAGR": post_crash_cagr,
                     "final_equity_usd": final_equity_usd,
@@ -798,7 +1059,7 @@ def run(cfg: RunConfig) -> pd.DataFrame:
     _ensure_out_dir(cfg.out_dir)
     out.to_csv(cfg.out_csv, index=False)
 
-    # Run manifest for audit
+    # Run manifest for audit (includes slice boundaries and bar count when sliced)
     _manifest_suffix = f"__{cfg.output_suffix}" if cfg.output_suffix else ""
     manifest_path = cfg.out_dir / f"portfolio_geometry_run_manifest{_manifest_suffix}.json"
     manifest = {
@@ -810,8 +1071,14 @@ def run(cfg: RunConfig) -> pd.DataFrame:
         "slippage_bps": cfg.slippage_bps,
         "mode": cfg.mode,
         "initial_equity": cfg.initial_equity,
+        "max_bars": getattr(cfg, "max_bars", None),
+        "start_date": getattr(cfg, "start_date", None),
+        "end_date": getattr(cfg, "end_date", None),
         "resolved_core_params": resolved_params,
     }
+    manifest["run_bars"] = run_bars
+    manifest["run_start_date"] = run_start_date
+    manifest["run_end_date"] = run_end_date
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -857,6 +1124,9 @@ def main():
         help="Output CSV path; ignored when --run_all_cost_regimes (paths get regime suffix).",
     )
     ap.add_argument("--debug_trace_max_bars", type=int, default=None, help="Limit timeline to N bars for fast trace (e.g. 2000)")
+    ap.add_argument("--max_bars", type=int, default=None, help="Fast run: use only first N closed bars (after intersection); truncates before core computation.")
+    ap.add_argument("--start", type=str, default=None, metavar="YYYY-MM-DD", help="Slice merged timeline to bars on or after this date (before core computation).")
+    ap.add_argument("--end", type=str, default=None, metavar="YYYY-MM-DD", help="Slice merged timeline to bars on or before this date (before core computation).")
     ap.add_argument("--initial_equity", type=float, default=10000.0, help="Initial equity in USD; equity_usd = equity_index * this (default 10000)")
     ap.add_argument(
         "--run_all_cost_regimes",
@@ -909,6 +1179,9 @@ def main():
         btc_data_file=btc_path,
         eth_data_file=eth_path,
         debug_trace_max_bars=args.debug_trace_max_bars,
+        max_bars=args.max_bars,
+        start_date=args.start,
+        end_date=args.end,
         initial_equity=float(args.initial_equity),
         output_suffix=None,
     )
@@ -963,6 +1236,9 @@ def _run_all_cost_regimes(
             btc_data_file=btc_path,
             eth_data_file=eth_path,
             debug_trace_max_bars=args.debug_trace_max_bars,
+            max_bars=args.max_bars,
+            start_date=args.start,
+            end_date=args.end,
             initial_equity=float(args.initial_equity),
             output_suffix=cost_regime,
         )

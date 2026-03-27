@@ -12,6 +12,7 @@ Available strategies:
     - sg_core_exposure_v1: Volatility-scaled exposure by regime
     - sg_trend_probe_v1: TREND_UP only strict trend following
     - sg_vol_probe_v1: VOL_COMPRESSION breakout hunting
+    - sg_mean_reversion_extreme_v1: Long-only RSI oversold mean reversion (defensive sleeve)
     - sg_stub_strategy: Minimal stub for testing
 
 Usage (from runtime/argus context):
@@ -28,5 +29,6 @@ __all__ = [
     "sg_core_exposure_v1",
     "sg_trend_probe_v1",
     "sg_vol_probe_v1",
+    "sg_mean_reversion_extreme_v1",
     "sg_stub_strategy",
 ]

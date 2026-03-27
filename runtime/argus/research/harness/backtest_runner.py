@@ -211,15 +211,18 @@ def run_backtest(
     fee_bps: float = 10.0,
     slippage_bps: float = 5.0,
     closed_only: bool = True,
+    moonwire_feed: Optional[Dict[int, float]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Walk-forward backtest using Layer 2 generate_intent.
 
     At each bar i (for i >= lookback):
       1. Call strategy_func(df[:i+1], ctx, closed_only=closed_only)
-      2. Process action & desired_exposure_frac
-      3. Adjust position to match desired exposure
+      2. If moonwire_feed is set, apply MoonWire overlay to desired_exposure_frac (Core unchanged).
+      3. Process action & desired_exposure_frac
+      4. Adjust position to match desired exposure
 
+    moonwire_feed: optional dict unix_ts -> probability; when set, overlay is applied for logging/trace.
     Returns:
         (equity_df, metrics_dict)
     """
@@ -275,8 +278,21 @@ def run_backtest(
             }
 
         action = _normalize_action(intent.get("action"))
-        desired_expo = float(intent.get("desired_exposure_frac") or 0.0)
-        desired_expo = max(0.0, min(1.0, desired_expo))
+        core_desired_expo = float(intent.get("desired_exposure_frac") or 0.0)
+        core_desired_expo = max(0.0, min(1.0, core_desired_expo))
+        desired_expo = core_desired_expo
+        moonwire_state: Optional[str] = None
+        moonwire_multiplier: Optional[float] = None
+        if moonwire_feed is not None:
+            from research.governance.moonwire_overlay import apply_overlay
+            try:
+                ts_unix = int(pd.Timestamp(ts).timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                desired_expo, overlay_meta = apply_overlay(core_desired_expo, ts_unix, moonwire_feed)
+                desired_expo = max(0.0, min(1.0, desired_expo))
+                moonwire_state = overlay_meta.get("moonwire_state")
+                moonwire_multiplier = overlay_meta.get("moonwire_multiplier")
+            except KeyError:
+                pass  # strict_ts=0: missing ts -> neutral already in apply_overlay
 
         # Compute target exposure based on action
         if action == "EXIT":
@@ -302,7 +318,6 @@ def run_backtest(
                 fill_price = price * (1.0 + slip_rate)
                 qty_to_buy = delta_value / fill_price
                 cost = qty_to_buy * fill_price * (1.0 + fee_rate)
-
                 if cost <= cash:
                     cash -= cost
                     pos_qty += qty_to_buy
@@ -328,7 +343,7 @@ def run_backtest(
         exposure_frac_history.append(curr_expo_final)
         in_market_flags.append(curr_expo_final > 0.01)  # > 1% exposure = in market
 
-        equity_rows.append({
+        row = {
             "Timestamp": ts,
             "equity": equity,
             "cash": cash,
@@ -339,7 +354,12 @@ def run_backtest(
             "applied_exposure": curr_expo_final,
             "fee_slippage_this_bar": cost_this_bar,
             "rebalanced": rebalanced,
-        })
+        }
+        if moonwire_feed is not None:
+            row["core_desired_exposure_frac"] = core_desired_expo
+            row["moonwire_state"] = moonwire_state
+            row["moonwire_multiplier"] = moonwire_multiplier
+        equity_rows.append(row)
 
     equity_df = pd.DataFrame(equity_rows)
     eq = equity_df["equity"].values
@@ -441,6 +461,8 @@ def main() -> Dict[str, Any]:
     fee_bps = _env_float("ARGUS_FEE_BPS", 10.0)
     slippage_bps = _env_float("ARGUS_SLIPPAGE_BPS", 5.0)
 
+    moonwire_feed = None
+
     print("=" * 60)
     print("BACKTEST RUNNER (Layer 2 Strategy)")
     print("=" * 60)
@@ -451,12 +473,28 @@ def main() -> Dict[str, Any]:
     print(f"Initial equity:  ${initial_equity:,.2f}")
     print(f"Fee (bps):       {fee_bps}")
     print(f"Slippage (bps):  {slippage_bps}")
+    if moonwire_feed is not None:
+        print(f"MoonWire overlay: variant={os.environ.get('MOONWIRE_OVERLAY_VARIANT', 'A')}")
     print("-" * 60)
 
     # Load strategy
     print(f"Loading strategy: {module_path}.{func_name}")
     strategy_func = load_strategy_func(module_path, func_name)
     print(f"  -> Loaded successfully")
+
+    # MoonWire overlay (exposure modifier): load feed after strategy
+    if os.environ.get("MOONWIRE_OVERLAY_ENABLED", "").strip() == "1":
+        signal_file = os.environ.get("MOONWIRE_SIGNAL_FILE", "").strip()
+        if not signal_file:
+            print("MoonWire overlay: SKIP (MOONWIRE_SIGNAL_FILE not set)")
+        elif not os.path.exists(signal_file):
+            print(f"MoonWire overlay: SKIP (file not found: {signal_file})")
+            print("  Ensure feed (check/validate/call moonwire-backend): python scripts/ensure_moonwire_signal_feed.py")
+        else:
+            from research.governance.moonwire_overlay import load_feed as moonwire_load_feed
+            moonwire_feed = moonwire_load_feed(signal_file)
+            variant = os.environ.get("MOONWIRE_OVERLAY_VARIANT", "A").strip().upper()
+            print(f"MoonWire overlay: ON (variant={variant}, feed={len(moonwire_feed)} entries)")
 
     # Load data
     print(f"Loading data: {data_file}")
@@ -481,6 +519,7 @@ def main() -> Dict[str, Any]:
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
         closed_only=True,
+        moonwire_feed=moonwire_feed,
     )
 
     # Per-bar trace export for behavioral diff (BTC-only; same dataset/env/date window)
@@ -499,7 +538,7 @@ def main() -> Dict[str, Any]:
     portfolio_return = np.full(n_eq, np.nan, dtype=float)
     for j in range(n_eq - 1):
         portfolio_return[j] = (eq_arr[j + 1] / eq_arr[j]) - 1.0
-    trace_df = pd.DataFrame({
+    trace_cols = {
         "timestamp": equity_df["Timestamp"],
         "close_price": equity_df["price"],
         "exposure": equity_df["exposure"],
@@ -513,7 +552,12 @@ def main() -> Dict[str, Any]:
         "bar_return_applied": portfolio_return,
         "fee_slippage_this_bar": equity_df["fee_slippage_this_bar"],
         "rebalanced": equity_df["rebalanced"],
-    })
+    }
+    if "core_desired_exposure_frac" in equity_df.columns:
+        trace_cols["core_desired_exposure_frac"] = equity_df["core_desired_exposure_frac"]
+        trace_cols["moonwire_state"] = equity_df["moonwire_state"]
+        trace_cols["moonwire_multiplier"] = equity_df["moonwire_multiplier"]
+    trace_df = pd.DataFrame(trace_cols)
     trace_df.to_csv(trace_path, index=False)
     print(f"Trace written: {trace_path}")
 
@@ -538,4 +582,5 @@ def main() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     main()
+
 

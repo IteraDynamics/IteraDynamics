@@ -1,11 +1,11 @@
 # download_btc_history.py
-# 🧬 BTC HISTORY DOWNLOADER - HOURLY CANDLES VIA COINBASE PUBLIC API
+# Asset-agnostic hourly candle history via Coinbase Exchange public API.
 #
 # Usage examples:
 #   python download_btc_history.py
-#       -> downloads BTC-USD hourly from 2019-01-01 to now into data/btc_hourly_2019-01-01_to_<today>.csv
+#       -> product from env (COINBASE_PRODUCT_ID / ARGUS_COINBASE_ASSET) or BTC-USD
 #
-#   python download_btc_history.py --start-date 2021-01-01 --end-date 2023-01-01 --outfile data/btc_hourly_2021-2023.csv
+#   set ARGUS_COINBASE_ASSET=sol && python download_btc_history.py --outfile data/solusd_3600s_2019-01-01_to_2025-12-30.csv
 #
 # This script ONLY uses Coinbase's public market-data endpoint (no API keys).
 # It does NOT touch RealBroker or your live Argus runtime files.
@@ -24,9 +24,19 @@ import requests
 
 
 COINBASE_EXCHANGE_URL = "https://api.exchange.coinbase.com"
-PRODUCT_ID_DEFAULT = "BTC-USD"
 GRANULARITY_DEFAULT = 3600  # 1 hour in seconds
 MAX_CANDLES_PER_REQUEST = 300  # per Coinbase docs
+
+
+def _resolve_argus_import():
+    """Load shared Coinbase product resolver from runtime/argus."""
+    repo_root = Path(__file__).resolve().parents[2]
+    argus_dir = repo_root / "runtime" / "argus"
+    if str(argus_dir) not in sys.path:
+        sys.path.insert(0, str(argus_dir))
+    from coinbase_product import resolve_coinbase_product_id
+
+    return resolve_coinbase_product_id
 
 
 def _utc_now() -> datetime:
@@ -109,7 +119,7 @@ def build_output_path(
             out_path = project_root / out_path
         return out_path
 
-    # Default: data/btc_hourly_<start>_to_<end>.csv
+    # Default: data/<product>_<granularity>s_<start>_to_<end>.csv
     data_dir = project_root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -123,16 +133,17 @@ def build_output_path(
 
 def main() -> None:
     current_file = Path(__file__).resolve()
-    project_root = current_file.parent
+    project_root = current_file.parents[2]
+    resolve_coinbase_product_id = _resolve_argus_import()
 
     parser = argparse.ArgumentParser(
-        description="Download BTC-USD historical candles from Coinbase Exchange (public API)."
+        description="Download historical candles from Coinbase Exchange (public API). Product: --product-id or env (see runtime/argus/coinbase_product.py)."
     )
     parser.add_argument(
         "--product-id",
         type=str,
-        default=PRODUCT_ID_DEFAULT,
-        help=f"Product ID (default: {PRODUCT_ID_DEFAULT})",
+        default=None,
+        help="Coinbase product (e.g. SOL-USD). If omitted, uses COINBASE_PRODUCT_ID / ARGUS_COINBASE_ASSET env; default BTC-USD.",
     )
     parser.add_argument(
         "--granularity",
@@ -162,7 +173,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    product_id = args.product_id
+    product_id = resolve_coinbase_product_id(args.product_id)
     granularity = args.granularity
     start = _parse_date_utc(args.start_date)
     end = _utc_now() if args.end_date is None else _parse_date_utc(args.end_date)

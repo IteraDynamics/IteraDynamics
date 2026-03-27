@@ -77,6 +77,34 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _dashboard_may_run_without_broker() -> bool:
+    """
+    Allow Streamlit to load when RealBroker is missing (minimal VB server deploy).
+
+    True if the operator explicitly configured VB dry-run paths, forced VB-only mode,
+    or a vb_state.json already exists at a known default location.
+    """
+    if _env_bool("DASHBOARD_VB_ONLY"):
+        return True
+    if (os.getenv("VB_DRY_RUN_STATE_PATH") or "").strip():
+        return True
+    if (os.getenv("VB_DRY_RUN_LOG_PATH") or "").strip():
+        return True
+    if (os.getenv("VB_DRY_RUN_DATA_STORE") or "").strip():
+        return True
+    for candidate in (
+        project_root / "vb_state.json",
+        repo_root.parent / "vb_state.json",
+        repo_root.parent.parent / "vb_state.json",
+    ):
+        try:
+            if candidate.exists():
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # ---------------------------
 # IMPORT REALBROKER
 # ---------------------------
@@ -123,7 +151,7 @@ except ImportError:
     CORTEX_PATH = project_root / "cortex.json"
     LOG_PATH = project_root / "argus.log"
 
-if RealBroker is None:
+if RealBroker is None and not _dashboard_may_run_without_broker():
     st.error(
         "❌ Could not import RealBroker.\n\n"
         "Checked:\n"
@@ -132,6 +160,8 @@ if RealBroker is None:
         "Make sure that:\n"
         "  1) On the server: `dashboard.py` and `src/real_broker.py` live under the same root (e.g., /opt/argus).\n"
         "  2) On your local mono-repo: `runtime/argus/src/real_broker.py` exists.\n\n"
+        "For **VB dry-run only** (no broker on disk), set e.g. `VB_DRY_RUN_STATE_PATH=/opt/argus/vb_state.json` "
+        "or `DASHBOARD_VB_ONLY=1` before starting Streamlit.\n\n"
         f"Debug detail: {broker_import_err}"
     )
     st.stop()
@@ -316,6 +346,117 @@ def read_logs() -> str:
     log_path = LOG_PATH
     txt = _safe_read_tail(log_path, n_lines=300)
     return txt if txt else "Waiting for logs..."
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    for p in paths:
+        try:
+            if p is not None and p.exists():
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _vb_paths() -> tuple[Path | None, Path | None, Path | None]:
+    """
+    VB dry-run integration paths.
+
+    Supports both common local layouts:
+    - state/log in repo root (what the VB runner CLI defaults to in your tests)
+    - state/log/store under runtime/argus (useful on server deployments)
+    """
+    vb_state_env = (os.getenv("VB_DRY_RUN_STATE_PATH") or "").strip()
+    vb_log_env = (os.getenv("VB_DRY_RUN_LOG_PATH") or "").strip()
+    vb_store_env = (os.getenv("VB_DRY_RUN_DATA_STORE") or "").strip()
+
+    vb_state = Path(vb_state_env).resolve() if vb_state_env else None
+    vb_log = Path(vb_log_env).resolve() if vb_log_env else None
+    vb_store = Path(vb_store_env).resolve() if vb_store_env else None
+
+    if vb_state is None:
+        vb_state = _first_existing(
+            [
+                project_root / "vb_state.json",
+                repo_root.parent / "vb_state.json",
+                repo_root.parent.parent / "vb_state.json",  # repo root (when you run from cwd)
+            ]
+        )
+
+    if vb_log is None:
+        vb_log = _first_existing(
+            [
+                project_root / "vb_live_log.jsonl",
+                repo_root.parent / "vb_live_log.jsonl",
+                repo_root.parent.parent / "vb_live_log.jsonl",
+                project_root.parent / "vb_live_log.jsonl",
+            ]
+        )
+
+    if vb_store is None:
+        vb_store = _first_existing(
+            [
+                project_root / "data" / "btc_live_dry_run.csv",
+                repo_root.parent / "runtime" / "argus" / "data" / "btc_live_dry_run.csv",
+                # If you run from repo root, state/log land there (2x up from runtime/argus)
+                repo_root.parent.parent / "runtime" / "argus" / "data" / "btc_live_dry_run.csv",
+            ]
+        )
+
+    return vb_state, vb_log, vb_store
+
+
+@st.cache_data(ttl=5)
+def load_vb_state(_mtime: float, path_str: str) -> dict | None:
+    p = Path(path_str)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=5)
+def load_vb_market_data(_mtime: float, path_str: str) -> pd.DataFrame:
+    p = Path(path_str)
+    if not p.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(p)
+        if "Timestamp" not in df.columns or "Close" not in df.columns:
+            return pd.DataFrame()
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["Timestamp"])
+        df = df.sort_values("Timestamp")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=2)
+def load_vb_latest_log_json(_mtime: float, path_str: str) -> dict | None:
+    p = Path(path_str)
+    if not p.exists():
+        return None
+    try:
+        txt = _safe_read_tail(p, n_lines=50)
+        for line in reversed(txt.splitlines()):
+            if line.strip():
+                return json.loads(line)
+    except Exception:
+        return None
+    return None
+
+
+def read_vb_logs() -> str:
+    vb_state_path, vb_log_path, vb_store_path = _vb_paths()
+    if vb_log_path is None:
+        return "Waiting for VB dry-run logs..."
+    txt = _safe_read_tail(vb_log_path, n_lines=300)
+    return txt if txt else "Waiting for VB dry-run logs..."
 
 
 @st.cache_data(ttl=5)
@@ -536,41 +677,102 @@ def _add_vline_shape(fig: go.Figure, x_dt: datetime, label: str, color: str) -> 
 def main():
     st.title("🦅 ARGUS // LIVE COMMANDER")
 
-    try:
-        broker = get_broker()
-        current_price = get_live_price()
-        df = load_market_data()
+    vb_state_path, vb_log_path, vb_store_path = _vb_paths()
+    vb_state = None
+    vb_latest_log = None
+    vb_df = pd.DataFrame()
 
-        cash, btc = broker.get_wallet_snapshot()
-        btc_exposure_usd = btc * current_price
-        equity = cash + btc_exposure_usd
+    if vb_state_path is not None:
+        try:
+            state_m = os.path.getmtime(str(vb_state_path)) if vb_state_path.exists() else 0.0
+            vb_state = load_vb_state(state_m, str(vb_state_path))
+        except Exception:
+            vb_state = None
+    if vb_log_path is not None:
+        try:
+            log_m = os.path.getmtime(str(vb_log_path)) if vb_log_path.exists() else 0.0
+            vb_latest_log = load_vb_latest_log_json(log_m, str(vb_log_path))
+        except Exception:
+            vb_latest_log = None
+    if vb_store_path is not None:
+        try:
+            store_m = os.path.getmtime(str(vb_store_path)) if vb_store_path.exists() else 0.0
+            vb_df = load_vb_market_data(store_m, str(vb_store_path))
+        except Exception:
+            vb_df = pd.DataFrame()
 
-        cortex = get_cortex_state()
-        prime_state = get_prime_state()
+    vb_mode = vb_state is not None
 
-        if cortex.get("mode") == "prime":
-            inferred_mode = "prime"
-        elif prime_state is not None:
-            inferred_mode = "prime"
-        else:
-            env_mode = (os.getenv("ARGUS_MODE") or "").strip().lower()
-            inferred_mode = "prime" if env_mode == "prime" else "legacy"
+    if vb_mode:
+        # VB dry-run mode: no RealBroker required.
+        inferred_mode = "vb_dry_run"
+        dry = True
+        cortex = {}
+        prime_state = None
+        cash, btc = 0.0, 0.0
+        btc_exposure_usd = 0.0
+        equity = 0.0
+        df = vb_df
 
-        dry = _env_bool("ARGUS_DRY_RUN", default=False) or _env_bool("PRIME_DRY_RUN", default=False)
+        latest_close = None
+        if isinstance(vb_latest_log, dict):
+            latest_close = vb_latest_log.get("latest_close")
+        if latest_close is None and not vb_df.empty and "Close" in vb_df.columns:
+            try:
+                latest_close = float(vb_df["Close"].iloc[-1])
+            except Exception:
+                latest_close = None
+        current_price = float(latest_close) if latest_close is not None else 0.0
 
-        legacy_entry = get_auto_entry_legacy()
-        if btc > 0 and legacy_entry > 0:
-            unrealized_pnl_usd = (current_price - legacy_entry) * btc
-            pnl_pct = (unrealized_pnl_usd / (legacy_entry * btc)) * 100
-        else:
-            unrealized_pnl_usd, pnl_pct = 0.0, 0.0
+        legacy_entry = 0.0
+        unrealized_pnl_usd, pnl_pct = 0.0, 0.0
+    else:
+        if RealBroker is None:
+            sp, _, _ = _vb_paths()
+            st.error(
+                "❌ RealBroker is not available and no VB dry-run state was loaded.\n\n"
+                "If you meant to monitor the VB loop, ensure the loop has written state, or set:\n"
+                "`VB_DRY_RUN_STATE_PATH`, `VB_DRY_RUN_LOG_PATH`, `VB_DRY_RUN_DATA_STORE`.\n\n"
+                f"Resolved VB state path hint: `{sp}`"
+            )
+            st.stop()
+            return
+        try:
+            broker = get_broker()
+            current_price = get_live_price()
+            df = load_market_data()
 
-    except Exception as e:
-        st.error(f"System Error: {e}")
-        return
+            cash, btc = broker.get_wallet_snapshot()
+            btc_exposure_usd = btc * current_price
+            equity = cash + btc_exposure_usd
+
+            cortex = get_cortex_state()
+            prime_state = get_prime_state()
+
+            if cortex.get("mode") == "prime":
+                inferred_mode = "prime"
+            elif prime_state is not None:
+                inferred_mode = "prime"
+            else:
+                env_mode = (os.getenv("ARGUS_MODE") or "").strip().lower()
+                inferred_mode = "prime" if env_mode == "prime" else "legacy"
+
+            dry = _env_bool("ARGUS_DRY_RUN", default=False) or _env_bool("PRIME_DRY_RUN", default=False)
+
+            legacy_entry = get_auto_entry_legacy()
+            if btc > 0 and legacy_entry > 0:
+                unrealized_pnl_usd = (current_price - legacy_entry) * btc
+                pnl_pct = (unrealized_pnl_usd / (legacy_entry * btc)) * 100
+            else:
+                unrealized_pnl_usd, pnl_pct = 0.0, 0.0
+        except Exception as e:
+            st.error(f"System Error: {e}")
+            return
 
     # Status badges
     mode_badge = "badge badge-green" if inferred_mode == "prime" else "badge"
+    if inferred_mode == "vb_dry_run":
+        mode_badge = "badge badge-amber"
     run_badge = "badge badge-amber" if dry else "badge badge-green"
     run_label = "DRY-RUN" if dry else "LIVE"
     st.markdown(
@@ -670,6 +872,42 @@ def main():
             "—" if not entry_px else f"{(current_price / float(entry_px) - 1) * 100:+.2f}%",
         )
 
+    elif inferred_mode == "vb_dry_run":
+        st.markdown("### 🧪 VB Sleeve Dry-Run")
+        ps = vb_state or {}
+
+        in_position = bool(ps.get("in_position", False))
+        current_exposure = ps.get("current_exposure")
+        try:
+            current_exposure_f = float(current_exposure) if current_exposure is not None else 0.0
+        except Exception:
+            current_exposure_f = 0.0
+
+        entry_px = ps.get("entry_price")
+        entry_ts = _parse_iso(ps.get("entry_timestamp"))
+        last_action = ps.get("last_action") or "—"
+
+        intent_action = None
+        applied_action = None
+        latest_bar_ts = None
+        latest_close = None
+        if isinstance(vb_latest_log, dict):
+            intent_action = vb_latest_log.get("intent_action")
+            applied_action = vb_latest_log.get("applied_action")
+            latest_bar_ts = vb_latest_log.get("latest_bar_ts")
+            latest_close = vb_latest_log.get("latest_close")
+
+        a, b, c, d = st.columns(4)
+        a.metric("Status", "IN POSITION" if in_position else "FLAT")
+        a.metric("Exposure", f"{current_exposure_f:.3f}")
+        b.metric("Entry Price", f"${float(entry_px):,.2f}" if entry_px else "—")
+        b.metric("Entry Time", _fmt_dt(entry_ts))
+        c.metric("Last Action", str(last_action))
+        c.metric("Latest Bar", str(latest_bar_ts) if latest_bar_ts else "—")
+        d.metric("Intent", str(intent_action) if intent_action else "—")
+        d.metric("Applied", str(applied_action) if applied_action else "—")
+
+        st.markdown("<div class='subtle'>VB dry-run uses vb_state.json + vb_live_log.jsonl; no RealBroker needed.</div>", unsafe_allow_html=True)
     else:
         st.markdown("### 📊 Active Position Analysis (Legacy)")
         avg_entry = legacy_entry if legacy_entry > 0 else 0.0
@@ -707,6 +945,10 @@ def main():
                     _add_vline_shape(fig, entry_line, "ENTRY", "rgba(0,255,0,0.45)")
                 if exit_line:
                     _add_vline_shape(fig, exit_line, "PLANNED EXIT", "rgba(255,165,0,0.45)")
+            elif inferred_mode == "vb_dry_run":
+                entry_line = _parse_iso((vb_state or {}).get("entry_timestamp"))
+                if entry_line:
+                    _add_vline_shape(fig, entry_line, "VB ENTRY", "rgba(0,255,0,0.45)")
 
             fig.update_layout(
                 template="plotly_dark",
@@ -781,6 +1023,28 @@ def main():
 
             st.markdown(line1 + line2 + line3 + line4, unsafe_allow_html=True)
 
+        elif inferred_mode == "vb_dry_run":
+            ps = vb_state or {}
+            in_position = bool(ps.get("in_position", False))
+            current_exposure = ps.get("current_exposure")
+            try:
+                current_exposure_f = float(current_exposure) if current_exposure is not None else 0.0
+            except Exception:
+                current_exposure_f = 0.0
+            last_action = ps.get("last_action") or "—"
+
+            latest_close = None
+            latest_bar_ts = None
+            if isinstance(vb_latest_log, dict):
+                latest_close = vb_latest_log.get("latest_close")
+                latest_bar_ts = vb_latest_log.get("latest_bar_ts")
+
+            st.markdown("### 🧠 VB Dry-Run Snapshot")
+            st.metric("In Position", "YES" if in_position else "NO")
+            st.metric("Exposure", f"{current_exposure_f:.3f}")
+            st.metric("Last Action", str(last_action))
+            st.metric("Latest Bar", str(latest_bar_ts) if latest_bar_ts else "—")
+            st.metric("Latest Close", f"${float(latest_close):,.2f}" if latest_close is not None else "—")
         else:
             fig_gauge = go.Figure(
                 go.Indicator(
@@ -813,7 +1077,10 @@ def main():
 
     # Row 4: Logs (escaped + <pre> to avoid weird glyph rendering)
     st.subheader("📜 System Logs")
-    logs_raw = read_logs()
+    if inferred_mode == "vb_dry_run":
+        logs_raw = read_vb_logs()
+    else:
+        logs_raw = read_logs()
     logs_safe = html.escape(logs_raw)
     st.markdown(f"<div class='log-box'><pre style='margin:0'>{logs_safe}</pre></div>", unsafe_allow_html=True)
 

@@ -1,0 +1,34 @@
+# Argus Streamlit dashboard — VB dry-run monitor (template)
+#
+# Binds 0.0.0.0 — restrict with firewall / reverse proxy + TLS.
+#
+# Install:
+#   sudo chmod +x /opt/argus/runtime/argus/deploy/run_argus_dashboard_vb.sh
+#   sudo cp argus_dashboard_vb.service /etc/systemd/system/argus-dashboard-vb.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now argus-dashboard-vb.service
+#
+# Logs: journalctl -u argus-dashboard-vb.service -f
+#
+# Override port: Environment=STREAMLIT_PORT=8502 in a drop-in, or edit the wrapper.
+
+[Unit]
+Description=Argus Streamlit dashboard (VB dry-run monitor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=argus
+Group=argus
+WorkingDirectory=/opt/argus/runtime/argus
+Environment=PYTHONUNBUFFERED=1
+Environment=VB_DRY_RUN_STATE_PATH=/opt/argus/vb_state.json
+Environment=VB_DRY_RUN_LOG_PATH=/opt/argus/vb_live_log.jsonl
+Environment=VB_DRY_RUN_DATA_STORE=/opt/argus/runtime/argus/data/btc_live_dry_run.csv
+ExecStart=/opt/argus/runtime/argus/deploy/run_argus_dashboard_vb.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

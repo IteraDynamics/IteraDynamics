@@ -219,6 +219,52 @@ def _get_policy() -> PortfolioPolicy:
     )
 
 
+# MoonWire overlay cache: path -> feed (unix_ts -> probability)
+_moonwire_feed_cache: Dict[str, Dict[int, float]] = {}
+_moonwire_feed_cache_path: Optional[str] = None
+
+
+def _apply_moonwire_overlay_if_enabled(
+    layer2_by_product: Dict[str, Any],
+    bar_ts_utc: str,
+) -> None:
+    """If MOONWIRE_OVERLAY_ENABLED=1, modify desired_exposure_frac for overlay product(s) (e.g. BTC-USD)."""
+    if os.environ.get("MOONWIRE_OVERLAY_ENABLED", "").strip() != "1":
+        return
+    signal_file = os.environ.get("MOONWIRE_SIGNAL_FILE", "").strip()
+    if not signal_file or not os.path.exists(signal_file):
+        return
+    try:
+        from research.portfolio.moonwire_overlay import (
+            load_feed as moonwire_load_feed,
+            apply_overlay,
+        )
+    except ImportError:
+        return
+    global _moonwire_feed_cache, _moonwire_feed_cache_path
+    if _moonwire_feed_cache_path != signal_file:
+        _moonwire_feed_cache_path = signal_file
+        _moonwire_feed_cache[signal_file] = moonwire_load_feed(signal_file)
+    feed = _moonwire_feed_cache[signal_file]
+    overlay_product_ids_raw = os.environ.get("MOONWIRE_OVERLAY_PRODUCT_ID", "BTC-USD").strip()
+    overlay_product_ids = [p.strip() for p in overlay_product_ids_raw.split(",") if p.strip()]
+    for pid in list(layer2_by_product.keys()):
+        if pid not in overlay_product_ids:
+            continue
+        intent = layer2_by_product[pid]
+        core = float(intent.get("desired_exposure_frac") or 0.0)
+        try:
+            final, meta = apply_overlay(core, bar_ts_utc, feed)
+            intent["desired_exposure_frac"] = max(0.0, min(1.0, final))
+            state_str = meta.get("moonwire_state", "")
+            mult = meta.get("moonwire_multiplier")
+            print(
+                f"[{_utc_now_str()}] [PORTFOLIO] MoonWire overlay {pid}: core={core:.4f} state={state_str} mult={mult} final={intent['desired_exposure_frac']:.4f}"
+            )
+        except KeyError:
+            pass
+
+
 def _utc_now_str() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -397,6 +443,9 @@ def run_portfolio_cycle() -> None:
         if intent is None:
             intent = {"action": "HOLD", "confidence": 0.0, "desired_exposure_frac": 0.0, "horizon_hours": 0, "reason": "no_strategy", "meta": {}}
         layer2_by_product[pid] = intent
+
+    # MoonWire overlay: modify Core desired_exposure_frac for configured product(s) before allocator
+    _apply_moonwire_overlay_if_enabled(layer2_by_product, bar_ts_utc)
 
     prev_weights = state.get("prev_target_weights") or {}
     try:

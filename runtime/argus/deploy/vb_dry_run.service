@@ -1,0 +1,40 @@
+# VB dry-run loop — systemd unit (template)
+#
+# Install:
+#   sudo cp vb_dry_run.service /etc/systemd/system/vb-dry-run.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vb-dry-run.service
+#
+# Logs: journalctl -u vb-dry-run.service -f
+#
+# Adjust User= and paths if your deploy user or layout differs.
+
+[Unit]
+Description=Itera Dynamics VB sleeve dry-run (Coinbase public candles, no trades)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=argus
+Group=argus
+WorkingDirectory=/opt/argus
+
+# Dry-run only: no broker, no orders
+Environment=PYTHONUNBUFFERED=1
+
+# Wrapper keeps ExecStart short and matches local CLI flags.
+ExecStart=/opt/argus/runtime/argus/deploy/run_vb_dry_run.sh
+
+# Alternative (no wrapper): single-line ExecStart; set User= to your deploy user.
+# ExecStart=/opt/argus/venv/bin/python /opt/argus/runtime/argus/run_live_loop_volatility_breakout_v1.py --data-store /opt/argus/runtime/argus/data/btc_live_dry_run.csv --state /opt/argus/vb_state.json --log /opt/argus/vb_live_log.jsonl --lookback 200 --cap 1.0 --interval 300
+
+Restart=on-failure
+RestartSec=30
+
+# Hardening (optional; comment out if they break your environment)
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
