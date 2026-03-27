@@ -6,6 +6,7 @@
 #
 # Example (PowerShell):
 #   python .\download_coinbase_history.py --product BTC-USD --granularity 3600 --days 730 --out .\data\historical\btc_usd_1h.csv
+#   set ARGUS_COINBASE_ASSET=sol && python .\download_coinbase_history.py --granularity 3600 --days 730 --out .\data\sol_usd_1h.csv
 #
 # Notes:
 # - Coinbase candles endpoint returns max ~300 candles per request, so we paginate.
@@ -28,8 +29,17 @@ from typing import List, Optional, Tuple
 
 import requests
 
-
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product}/candles"
+
+
+def _resolve_product(explicit: str | None) -> str:
+    repo = Path(__file__).resolve().parents[2]
+    argus = repo / "runtime" / "argus"
+    if str(argus) not in sys.path:
+        sys.path.insert(0, str(argus))
+    from coinbase_product import resolve_coinbase_product_id
+
+    return resolve_coinbase_product_id(explicit)
 
 
 @dataclass
@@ -55,7 +65,12 @@ class Candle:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download Coinbase historical candles to flight_recorder-compatible CSV.")
-    p.add_argument("--product", type=str, default="BTC-USD", help="Coinbase product id (e.g. BTC-USD, ETH-USD).")
+    p.add_argument(
+        "--product",
+        type=str,
+        default=None,
+        help="Coinbase product id (e.g. SOL-USD). If omitted, env COINBASE_PRODUCT_ID / ARGUS_COINBASE_ASSET; default BTC-USD.",
+    )
     p.add_argument("--granularity", type=int, default=3600, help="Seconds per candle. 3600=1h, 86400=1d, etc.")
     p.add_argument("--days", type=int, default=365, help="How many days of history to fetch.")
     p.add_argument("--out", type=str, default=None, help="Output CSV path.")
@@ -157,9 +172,14 @@ def write_csv(path: Path, candles: List[Candle]) -> None:
 
 def main() -> None:
     args = parse_args()
+    product = _resolve_product(args.product)
 
     root = Path.cwd()
-    out_path = Path(args.out) if args.out else (root / "data" / "historical" / f"{args.product.replace('-','_').lower()}_{args.granularity}s.csv")
+    out_path = (
+        Path(args.out)
+        if args.out
+        else (root / "data" / "historical" / f"{product.replace('-', '_').lower()}_{args.granularity}s.csv")
+    )
 
     gran = int(args.granularity)
     if gran <= 0:
@@ -175,7 +195,7 @@ def main() -> None:
 
     chunks = daterange_chunks(end=end, start=start, chunk_seconds=chunk_seconds)
 
-    print(f"PRODUCT: {args.product}")
+    print(f"PRODUCT: {product}")
     print(f"GRAN   : {gran} seconds ({gran/3600:.2f} hours)")
     print(f"START  : {start.isoformat()}")
     print(f"END    : {end.isoformat()}")
@@ -187,7 +207,7 @@ def main() -> None:
     with requests.Session() as session:
         for idx, (s, e) in enumerate(chunks, start=1):
             try:
-                candles = fetch_chunk(session, args.product, gran, s, e, timeout=float(args.timeout))
+                candles = fetch_chunk(session, product, gran, s, e, timeout=float(args.timeout))
                 all_candles.extend(candles)
                 print(f"[{idx:03d}/{len(chunks):03d}] {iso_z(s)} → {iso_z(e)}  got={len(candles)}  total={len(all_candles)}")
             except Exception as ex:

@@ -1,26 +1,46 @@
 """
-Live market data for VB dry-run (no auth, no trading).
+Live market data for dry-run (no auth, no trading).
 
-Fetches BTC-USD hourly candles from Coinbase Exchange public API and maintains
-a rolling CSV store: init from existing, fetch newer candles, append, dedupe by timestamp, UTC only.
+Fetches hourly candles from Coinbase Exchange public API for a configurable product
+and maintains a rolling CSV store: init from existing, fetch newer candles, append,
+dedupe by timestamp, UTC only.
+
+Product selection (override order):
+  1) Argument to update_coinbase_store(..., product_id=...)
+  2) COINBASE_PRODUCT_ID or ARGUS_PRODUCT_ID (e.g. SOL-USD)
+  3) ARGUS_COINBASE_ASSET or COINBASE_ASSET short code (e.g. sol -> SOL-USD)
+  4) Default BTC-USD
+
+See runtime/argus/coinbase_product.py
 """
 
 from __future__ import annotations
 
+import importlib.util
 from datetime import timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List
 
 import pandas as pd
 import requests
 
-COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+_pkg_dir = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location(
+    "coinbase_product",
+    _pkg_dir / "coinbase_product.py",
+)
+if _spec is None or _spec.loader is None:  # pragma: no cover
+    raise ImportError("coinbase_product.py not found next to live_data.py")
+_coinbase_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_coinbase_mod)
+resolve_coinbase_product_id = _coinbase_mod.resolve_coinbase_product_id
+
 GRANULARITY_HOUR = 3600
 MAX_CANDLES_PER_REQUEST = 300  # Coinbase limit
 
 
 def fetch_recent_hourly_candles(
-    product_id: str = "BTC-USD",
+    product_id: str | None = None,
     granularity: int = GRANULARITY_HOUR,
     timeout_sec: int = 15,
 ) -> List[List[Any]]:
@@ -28,7 +48,8 @@ def fetch_recent_hourly_candles(
     Fetch recent hourly candles from Coinbase Exchange (public, no API key).
     Returns list of [time_unix_sec, low, high, open, close, volume].
     """
-    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles"
+    pid = resolve_coinbase_product_id(product_id)
+    url = f"https://api.exchange.coinbase.com/products/{pid}/candles"
     params = {"granularity": granularity}
     resp = requests.get(url, params=params, timeout=timeout_sec)
     resp.raise_for_status()
@@ -74,18 +95,21 @@ def load_existing_store(csv_path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
 
-def update_btc_store(
+def update_coinbase_store(
     csv_path: Path,
-    product_id: str = "BTC-USD",
+    product_id: str | None = None,
 ) -> pd.DataFrame:
     """
     Initialize from existing CSV if present, fetch newer hourly candles from Coinbase,
     append and deduplicate by timestamp (UTC), then write back to csv_path.
     Returns the updated DataFrame (sorted by Timestamp ascending).
+
+    product_id: explicit Coinbase product (e.g. SOL-USD); if None, uses env / default.
     """
+    pid = resolve_coinbase_product_id(product_id)
     df = load_existing_store(csv_path)
     try:
-        raw = fetch_recent_hourly_candles(product_id=product_id, granularity=GRANULARITY_HOUR)
+        raw = fetch_recent_hourly_candles(product_id=pid, granularity=GRANULARITY_HOUR)
     except Exception as e:
         if df.empty:
             raise
@@ -115,3 +139,8 @@ def update_btc_store(
     out.to_csv(csv_path, index=False)
     combined["Timestamp"] = pd.to_datetime(combined["Timestamp"], utc=True)
     return combined.sort_values("Timestamp").reset_index(drop=True)
+
+
+def update_btc_store(csv_path: Path, product_id: str | None = None) -> pd.DataFrame:
+    """Backward-compatible alias for update_coinbase_store."""
+    return update_coinbase_store(csv_path, product_id=product_id)

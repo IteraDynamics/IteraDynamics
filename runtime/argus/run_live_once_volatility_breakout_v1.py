@@ -6,7 +6,7 @@ This script simulates one live decision cycle for a single Layer 2 strategy:
 
 Modes:
 - Static CSV: --csv path (load from file, decision at last bar).
-- Live dry-run: --data-store path (fetch recent BTC hourly from Coinbase, update store, decision at latest closed bar).
+- Live dry-run: --data-store path (fetch recent hourly candles from Coinbase for --coinbase-product or env, update store).
 
 No real trades; no Prime/signal_generator; no broker integration.
 Duplicate-bar protection: state._meta.last_processed_bar_ts skips reprocessing the same bar.
@@ -105,6 +105,8 @@ class LiveConfig:
     log_path: Optional[Path] = None
     csv_path: Optional[Path] = None
     data_store_path: Optional[Path] = None
+    #: Coinbase product id (e.g. SOL-USD). None => use COINBASE_PRODUCT_ID / ARGUS_COINBASE_ASSET env.
+    coinbase_product_id: Optional[str] = None
 
 
 def _load_btc_csv_like_harness(csv_path: Path) -> pd.DataFrame:
@@ -185,10 +187,10 @@ def run_once(cfg: LiveConfig) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]
     # 1) Data: live store or static CSV
     if cfg.data_store_path is not None:
         try:
-            from live_data import update_btc_store
+            from live_data import update_coinbase_store
         except ImportError:
-            from runtime.argus.live_data import update_btc_store
-        df = update_btc_store(cfg.data_store_path)
+            from runtime.argus.live_data import update_coinbase_store
+        df = update_coinbase_store(cfg.data_store_path, product_id=cfg.coinbase_product_id)
         if df is None or df.empty:
             raise ValueError("live_data_empty")
     elif cfg.csv_path is not None:
@@ -336,8 +338,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Run one VB dry-run cycle (static CSV or live data store). No real trades."
     )
-    ap.add_argument("--csv", type=str, default=None, help="Static BTC CSV (backtest harness format). Omit if using --data-store.")
+    ap.add_argument("--csv", type=str, default=None, help="Static OHLCV CSV (backtest harness format). Omit if using --data-store.")
     ap.add_argument("--data-store", type=str, default=None, help="Rolling CSV path for live data (fetch from Coinbase, append, dedupe).")
+    ap.add_argument(
+        "--coinbase-product",
+        type=str,
+        default=None,
+        help="Coinbase product id (e.g. SOL-USD). Default: COINBASE_PRODUCT_ID, ARGUS_PRODUCT_ID, or ARGUS_COINBASE_ASSET / COINBASE_ASSET, else BTC-USD.",
+    )
     ap.add_argument("--state", type=str, default="vb_state.json", help="State JSON path (default: vb_state.json).")
     ap.add_argument("--log", type=str, default=None, help="Optional JSONL log path.")
     ap.add_argument("--lookback", type=int, default=200, help="Lookback bars (default: 200).")
@@ -359,5 +367,6 @@ if __name__ == "__main__":
         log_path=Path(args.log).resolve() if args.log else None,
         csv_path=csv_path,
         data_store_path=data_store_path,
+        coinbase_product_id=(str(args.coinbase_product).strip() or None) if args.coinbase_product else None,
     )
     run_once(cfg)

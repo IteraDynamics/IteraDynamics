@@ -24,8 +24,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Run VB dry-run in a loop (polling). No real trades."
     )
-    ap.add_argument("--csv", type=str, default=None, help="Static BTC CSV. Omit if using --data-store.")
+    ap.add_argument("--csv", type=str, default=None, help="Static OHLCV CSV. Omit if using --data-store.")
     ap.add_argument("--data-store", type=str, default=None, help="Rolling CSV for live data (Coinbase).")
+    ap.add_argument(
+        "--coinbase-product",
+        type=str,
+        default=None,
+        help="Coinbase product (e.g. SOL-USD). Else env COINBASE_PRODUCT_ID / ARGUS_COINBASE_ASSET; default BTC-USD.",
+    )
     ap.add_argument("--state", type=str, default="vb_state.json", help="State JSON path.")
     ap.add_argument("--log", type=str, default=None, help="Optional JSONL log path.")
     ap.add_argument("--lookback", type=int, default=200, help="Lookback bars.")
@@ -40,6 +46,9 @@ def main() -> int:
     if data_store_path is not None and csv_path is not None:
         ap.error("Provide only one of --csv or --data-store")
 
+    cp = args.coinbase_product
+    coinbase_product_id = str(cp).strip() if cp else None
+
     cfg = LiveConfig(
         state_path=Path(args.state).resolve(),
         lookback=int(args.lookback),
@@ -48,6 +57,7 @@ def main() -> int:
         log_path=Path(args.log).resolve() if args.log else None,
         csv_path=csv_path,
         data_store_path=data_store_path,
+        coinbase_product_id=coinbase_product_id,
     )
 
     interval = max(60, int(args.interval))

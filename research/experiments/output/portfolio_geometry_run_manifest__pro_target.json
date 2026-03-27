@@ -1,0 +1,28 @@
+{
+  "cost_regime": "pro_target",
+  "env_file": null,
+  "btc_data_file": "C:\\Users\\admin\\OneDrive\\Desktop\\Desktop\\IteraDynamics_Mono\\data\\btcusd_3600s_2019-01-01_to_2025-12-30.csv",
+  "eth_data_file": "C:\\Users\\admin\\OneDrive\\Desktop\\Desktop\\IteraDynamics_Mono\\data\\ethusd_3600s_2019-01-01_to_2025-12-30.csv",
+  "fee_bps": 10.0,
+  "slippage_bps": 5.0,
+  "mode": "net",
+  "initial_equity": 10000.0,
+  "resolved_core_params": {
+    "ema_fast": 20,
+    "ema_slow": 50,
+    "atr_len": 14,
+    "horizon_hours": 48,
+    "max_expo_trend_up": 0.75,
+    "base_expo_compression": 0.12,
+    "max_expo_compression": 0.2,
+    "target_atr_pct": 0.01,
+    "atr_floor": 0.003,
+    "scale_cap": 1.0,
+    "trend_strength_weak": 0.2,
+    "trend_strength_strong": 0.6,
+    "enable_macro_filter": 1,
+    "macro_ema_len": 200,
+    "macro_expo_cap_bear": 0.25,
+    "macro_slope_lag": 1
+  }
+}
